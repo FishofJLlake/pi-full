@@ -16,7 +16,7 @@
 
 Reads dataset_config.json and values.json, loads a single episode via LeRobotDataset,
 and provides a timeline scrubber + value curve. values.json is a dict with keys
-(episode_idx, timestamp) and values as the value function outputs.
+(episode_index, frame_index) and values as the value function outputs.
 
 Usage:
     streamlit run src/opentau/scripts/value_visualizer_app.py -- \\
@@ -29,58 +29,46 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
+import copy
 from pathlib import Path
 
+import draccus
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 import torch
 from PIL import Image
 
-from opentau.configs.default import DatasetConfig
+from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
 from opentau.configs.train import TrainPipelineConfig
+from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.factory import make_dataset
+from opentau.scripts.value_artifacts import load_value_labels
+from opentau.scripts.value_artifacts import load_values
+from opentau.scripts.value_visualizer_frontend import build_scrubber_frames, build_value_scrubber_html
 
 # Hardcoded path to logo image shown in the header.
 LOGO_PATH = Path("assets/logo.png")
 
 
-def load_dataset_config(path: Path) -> tuple[Path, str, list[int]]:
-    """Load dataset_config.json; return (root, repo_id, list of episode indices)."""
-    with open(path) as f:
-        cfg = json.load(f)
-    datasets = cfg.get("datasets", [])
-    if not datasets:
+def load_dataset_config(path: Path) -> tuple[DatasetConfig, list[int]]:
+    """Load the first complete dataset entry and its configured episodes."""
+    mixture = draccus.parse(
+        config_class=DatasetMixtureConfig,
+        config_path=path,
+        args=[],
+    )
+    if not mixture.datasets:
         raise ValueError(f"No 'datasets' in {path}")
-    first = datasets[0]
-    root = Path(first["root"]).resolve()
-    repo_id = first.get("repo_id", "TensorAuto/libero")
-    episodes = first.get("episodes", [0])
+    first = copy.deepcopy(mixture.datasets[0])
+    if first.repo_id is None:
+        raise ValueError("Value visualization requires a LeRobot repo_id dataset")
+    root = Path(first.root) if first.root is not None else HF_OPENTAU_HOME / first.repo_id
+    first.root = str(root.resolve())
+    episodes = first.episodes if first.episodes is not None else [0]
     episodes = sorted(episodes) if isinstance(episodes, list) else list(range(episodes))
-    return root, repo_id, episodes
-
-
-def load_values(path: Path) -> dict[tuple[int, float], float]:
-    """Load values.json. Dict with keys (episode_idx, timestamp) and values as floats.
-
-    JSON keys are strings like "episode_idx,timestamp"; normalize to (int, round(ts, 6)).
-    """
-    with open(path) as f:
-        raw = json.load(f)
-    out = {}
-    for k, v in raw.items():
-        k = str(k).strip()
-        if k.startswith("(") and k.endswith(")"):
-            k = k[1:-1]
-        parts = k.replace(" ", "").split(",", 1)
-        if len(parts) != 2:
-            continue
-        ep_idx = int(parts[0])
-        ts = round(float(parts[1]), 6)
-        out[(ep_idx, ts)] = float(v)
-    return out
+    return first, episodes
 
 
 def _tensor_or_array_to_pil(x) -> Image.Image | None:
@@ -107,10 +95,28 @@ def load_frames_lerobot_cached(
     values_path: Path,
     episode_index: int,
     camera_key: str,
+    raw_advantages_path: Path | None = None,
+    effective_advantages_path: Path | None = None,
+    advantage_sources_path: Path | None = None,
 ) -> pd.DataFrame:
-    """Load a single episode via LeRobotDataset and attach values. Returns DataFrame with step, value, image."""
-    root, repo_id, _ = load_dataset_config(dataset_config_path)
+    """Load one episode and attach frame-indexed values to its display rows."""
+    dataset_cfg, _ = load_dataset_config(dataset_config_path)
     value_lookup = load_values(values_path)
+
+    raw_lookup = load_values(raw_advantages_path) if raw_advantages_path is not None else {}
+    effective_lookup = (
+        load_values(effective_advantages_path) if effective_advantages_path is not None else {}
+    )
+    source_lookup = (
+        load_value_labels(advantage_sources_path) if advantage_sources_path is not None else {}
+    )
+
+    def advantage_columns(key: tuple[int, int]) -> dict[str, object]:
+        return {
+            "raw_advantage": raw_lookup.get(key, np.nan),
+            "effective_advantage": effective_lookup.get(key, np.nan),
+            "advantage_source": source_lookup.get(key, ""),
+        }
 
     if train_config_path is None:
         train_config_path = dataset_config_path.parent / "train_config.json"
@@ -118,17 +124,21 @@ def load_frames_lerobot_cached(
             train_config_path = dataset_config_path.parent
     path = Path(train_config_path).resolve()
     train_cfg = TrainPipelineConfig.from_pretrained(path, local_files_only=True)
+    train_cfg.val_freq = 0
 
-    dataset_cfg = DatasetConfig(
-        repo_id=repo_id,
-        root=str(root),
-        episodes=[episode_index],
+    dataset_cfg.episodes = [episode_index]
+    dataset_cfg.prompt_substitutions = None
+    dataset_cfg.image_transforms.enable = False
+    res = make_dataset(
+        dataset_cfg,
+        train_cfg,
+        return_advantage_input=True,
+        local_files_only=True,
     )
-    res = make_dataset(dataset_cfg, train_cfg, return_advantage_input=True)
     dataset = res[0] if isinstance(res, tuple) else res
     camera_key = camera_key if camera_key is not None else "camera0"
 
-    # DataLoader calls __getitem__; each batch contains episode_index and timestamp.
+    # DataLoader calls __getitem__; each batch contains episode, frame, and timestamp metadata.
     # With batch_size=1, each iteration visits one datapoint (one frame) exactly once.
     batch_size = 1
     dataloader = torch.utils.data.DataLoader(
@@ -139,7 +149,7 @@ def load_frames_lerobot_cached(
     )
     all_rows = []
     for batch in dataloader:
-        if "episode_index" not in batch or "timestamp" not in batch:
+        if any(key not in batch for key in ("episode_index", "frame_index", "timestamp")):
             # Fallback: batch from older dataset; build from per-sample __getitem__
             start_idx = len(all_rows)
             n_in_batch = next(
@@ -149,62 +159,73 @@ def load_frames_lerobot_cached(
                 item = dataset[start_idx + i]
                 ep = item.get("episode_index", episode_index)
                 ep = int(ep.item() if hasattr(ep, "item") else ep) if ep is not None else episode_index
+                frame_idx = item.get("frame_index")
+                if frame_idx is None:
+                    raise KeyError("Value visualization requires frame_index metadata")
+                frame_idx = int(frame_idx.item() if hasattr(frame_idx, "item") else frame_idx)
                 ts = item.get("timestamp")
                 ts = float(ts.item() if hasattr(ts, "item") else ts) if ts is not None else 0.0
-                key_round = (ep, round(ts, 6))
-                value = value_lookup.get(key_round, value_lookup.get((ep, ts), np.nan))
+                value = value_lookup.get((ep, frame_idx), np.nan)
                 pil_img = _tensor_or_array_to_pil(item.get(camera_key))
                 all_rows.append(
                     {
                         "step": len(all_rows),
                         "episode_index": ep,
+                        "frame_index": frame_idx,
                         "timestamp": ts,
                         "value": value,
                         "image": pil_img,
+                        **advantage_columns((ep, frame_idx)),
                     }
                 )
             continue
         ep_b = batch["episode_index"]
+        frame_b = batch["frame_index"]
         ts_b = batch["timestamp"]
         if ep_b.dim() > 1:
             ep_b = ep_b.squeeze(-1)
+        if frame_b.dim() > 1:
+            frame_b = frame_b.squeeze(-1)
         if ts_b.dim() > 1:
             ts_b = ts_b.squeeze(-1)
         imgs_b = batch[camera_key]
         if imgs_b.dim() == 5:
-            imgs_b = imgs_b[:, 0]
+            imgs_b = imgs_b[:, -1]
         for i in range(ep_b.shape[0]):
             ep = int(ep_b[i].item())
+            frame_idx = int(frame_b[i].item())
             ts = float(ts_b[i].item())
-            key_round = (ep, round(ts, 6))
-            value = value_lookup.get(key_round, value_lookup.get((ep, ts), np.nan))
+            value = value_lookup.get((ep, frame_idx), np.nan)
             pil_img = _tensor_or_array_to_pil(imgs_b[i])
             all_rows.append(
                 {
                     "step": len(all_rows),
                     "episode_index": ep,
+                    "frame_index": frame_idx,
                     "timestamp": ts,
                     "value": value,
                     "image": pil_img,
+                    **advantage_columns((ep, frame_idx)),
                 }
             )
     df = pd.DataFrame(all_rows)
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    df = df.sort_values("frame_index").reset_index(drop=True)
     df["step"] = np.arange(len(df))
     return df
 
 
-def run_app(df: pd.DataFrame) -> None:
+def run_app(df: pd.DataFrame, series_label: str = "Value") -> None:
     """Run the Streamlit UI with the prepared DataFrame (step, value, image)."""
-    st.set_page_config(page_title="VLA Value Function Visualizer", layout="wide")
+    series_label = series_label.strip() or "Value"
+    st.set_page_config(page_title=f"VLA {series_label} Visualizer", layout="wide")
     # Header: logo (if file exists) + title
     logo_col, title_col = st.columns([1, 5])
     with logo_col:
         if LOGO_PATH.is_file():
             st.image(str(LOGO_PATH), width=380)
     with title_col:
-        st.title("VLA Value Function Analysis")
-    st.markdown("Synchronize robot states with predicted value function progress (single episode).")
+        st.title(f"VLA {series_label} Analysis")
+    st.markdown(f"Synchronize robot states with predicted {series_label} (single episode).")
 
     st.sidebar.header("Settings")
     smoothing = st.sidebar.slider("Graph Smoothing (Window)", 1, 10, 3)
@@ -222,69 +243,19 @@ def run_app(df: pd.DataFrame) -> None:
         st.warning("No frames loaded.")
         return
 
-    # Slider is rendered below the value graph; use session state so col1/col2 can use it
+    # Render the timeline in the browser so dragging updates without waiting for a Streamlit rerun.
     current_step = st.session_state.get("timeline_scrubber", 0)
     current_step = max(0, min(current_step, n - 1))
-
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-        st.subheader(f"Camera Feed (Step {current_step})")
-        row = df.iloc[current_step]
-        if row["image"] is not None:
-            st.image(row["image"], width="stretch")
-        else:
-            st.info("No image for this frame.")
-        with st.container(border=True):
-            st.metric("Predicted Value", f"{row['value']:.3f}" if np.isfinite(row["value"]) else "—")
-            st.caption(f"Episode {int(row['episode_index'])}, t = {row['timestamp']:.2f}s")
-
-    with col2:
-        st.subheader("Value Function $V(s)$")
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=df["step"],
-                y=df["display_value"],
-                mode="lines",
-                line={"color": "#1f77b4", "width": 3},
-                name="Value Function",
-            )
-        )
-        fig.add_vline(x=current_step, line_width=2, line_dash="dash", line_color="red")
-        y_cur = df["display_value"].iloc[current_step]
-        fig.add_trace(
-            go.Scatter(
-                x=[current_step],
-                y=[y_cur],
-                mode="markers",
-                marker={"color": "red", "size": 10},
-                showlegend=False,
-            )
-        )
-        y_min = df["display_value"].min()
-        y_max = df["display_value"].max()
-        y_range = [y_min - 0.05 * (y_max - y_min + 1e-6), y_max + 0.05 * (y_max - y_min + 1e-6)]
-        fig.update_layout(
-            xaxis_title="Timestep (t)",
-            yaxis_title="Value V(s)",
-            yaxis={"range": y_range},
-            margin={"l": 0, "r": 0, "t": 0, "b": 0},
-            height=400,
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig, width="stretch")
-
-        # Slider under the value graph
-        st.slider("Timeline Scrubber", 0, n - 1, current_step, key="timeline_scrubber")
-
-    st.divider()
-    m1, m2, m3 = st.columns(3)
-    v_cur = df["value"].iloc[current_step]
-    v_prev = df["value"].iloc[max(0, current_step - 1)] if current_step > 0 else v_cur
-    m1.metric("Current Value", f"{v_cur:.3f}" if np.isfinite(v_cur) else "—")
-    m2.metric("Max Value", f"{df['value'].max():.3f}" if np.isfinite(df["value"]).any() else "—")
-    m3.metric("Step Delta", f"{v_cur - v_prev:.4f}" if np.isfinite(v_cur) and np.isfinite(v_prev) else "—")
+    frames = build_scrubber_frames(df)
+    components.html(
+        build_value_scrubber_html(
+            frames,
+            initial_step=current_step,
+            series_label=series_label,
+        ),
+        height=940,
+        scrolling=True,
+    )
 
 
 def main() -> None:
@@ -301,13 +272,37 @@ def main() -> None:
         "--values",
         type=Path,
         required=True,
-        help="Path to values.json (dict: keys (episode_idx, timestamp), values: float)",
+        help="Path to values.json (dict: keys (episode_index, frame_index), values: float)",
+    )
+    parser.add_argument(
+        "--series-label",
+        type=str,
+        default="Value",
+        help="Displayed series name, for example 'Raw STEAM Advantage'.",
     )
     parser.add_argument(
         "--train-config",
         type=Path,
         default=None,
         help="Path to train_config.json or directory containing it (default: same dir as dataset-config)",
+    )
+    parser.add_argument(
+        "--raw-advantages",
+        type=Path,
+        default=None,
+        help="Optional frame-keyed raw_advantages.json shown in frame details.",
+    )
+    parser.add_argument(
+        "--effective-advantages",
+        type=Path,
+        default=None,
+        help="Optional frame-keyed advantages.json shown in frame details.",
+    )
+    parser.add_argument(
+        "--advantage-sources",
+        type=Path,
+        default=None,
+        help="Optional frame-keyed advantage_sources.json shown in frame details.",
     )
     parser.add_argument(
         "--episode",
@@ -330,7 +325,16 @@ def main() -> None:
     if not values_path.is_file():
         raise SystemExit(f"Values file not found: {values_path}")
 
-    root, repo_id, episodes = load_dataset_config(dataset_config_path)
+    _, episodes = load_dataset_config(dataset_config_path)
+    optional_paths = {
+        "raw advantages": args.raw_advantages,
+        "effective advantages": args.effective_advantages,
+        "advantage sources": args.advantage_sources,
+    }
+    for label, optional_path in optional_paths.items():
+        if optional_path is not None and not optional_path.resolve().is_file():
+            raise SystemExit(f"{label.title()} file not found: {optional_path.resolve()}")
+
     episode_index = args.episode if args.episode is not None else episodes[0]
 
     df = load_frames_lerobot_cached(
@@ -339,8 +343,11 @@ def main() -> None:
         values_path,
         episode_index,
         args.camera_key,
+        raw_advantages_path=args.raw_advantages.resolve() if args.raw_advantages else None,
+        effective_advantages_path=args.effective_advantages.resolve() if args.effective_advantages else None,
+        advantage_sources_path=args.advantage_sources.resolve() if args.advantage_sources else None,
     )
-    run_app(df)
+    run_app(df, series_label=args.series_label)
 
 
 if __name__ == "__main__":
