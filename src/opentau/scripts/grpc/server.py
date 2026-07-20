@@ -49,6 +49,7 @@ Usage:
 
 import io
 import logging
+import math
 import threading
 import time
 import traceback
@@ -318,28 +319,58 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         Returns:
             Tensor of shape (1, C, H, W) normalized to [0, 1].
         """
+        if not camera_image.image_data:
+            raise ValueError("Image payload is empty")
+
         if camera_image.encoding in ["jpeg", "png"]:
-            # Decode compressed image
-            image = Image.open(io.BytesIO(camera_image.image_data))
-            image = image.convert("RGB")
-            image = image.resize(self.cfg.resolution[::-1])  # PIL uses (W, H)
-            image_array = np.array(image, dtype=np.float32) / 255.0
+            # Keep the native resolution. Policy preprocessing owns resize,
+            # letterbox and normalization decisions.
+            try:
+                with Image.open(io.BytesIO(camera_image.image_data)) as image:
+                    image.load()
+                    actual_encoding = (image.format or "").lower()
+                    expected_encoding = "jpeg" if camera_image.encoding == "jpeg" else "png"
+                    if actual_encoding != expected_encoding:
+                        raise ValueError(
+                            f"Image encoding says {camera_image.encoding!r}, "
+                            f"but payload is {actual_encoding or 'unknown'!r}"
+                        )
+                    image_array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError(f"Invalid {camera_image.encoding} image payload") from exc
         elif camera_image.encoding == "raw":
-            # Raw image data - assume it's already in the right shape
+            # The wire protocol has no shape/dtype metadata. Its existing raw
+            # contract is float32 HWC RGB with a square image, so infer H/W and
+            # reject payloads that cannot satisfy that contract.
+            dtype = np.dtype(np.float32)
+            channels = 3
+            pixel_stride = dtype.itemsize * channels
+            if len(camera_image.image_data) % pixel_stride != 0:
+                raise ValueError(
+                    "Raw image byte length must be divisible by "
+                    f"float32 itemsize * {channels} channels ({pixel_stride})"
+                )
+            num_pixels = len(camera_image.image_data) // pixel_stride
+            side = math.isqrt(num_pixels)
+            if side <= 0 or side * side != num_pixels:
+                raise ValueError(
+                    "Raw image payload must describe a non-empty square HWC RGB image; "
+                    f"got {num_pixels} pixels"
+                )
             image_array = np.frombuffer(camera_image.image_data, dtype=np.float32)
-            # Reshape assuming square image with 3 channels
-            side = int(np.sqrt(len(image_array) / 3))
-            image_array = image_array.reshape(side, side, 3)
-            # Resize if needed
-            if (side, side) != self.cfg.resolution:
-                image = Image.fromarray((image_array * 255).astype(np.uint8))
-                image = image.resize(self.cfg.resolution[::-1])
-                image_array = np.array(image, dtype=np.float32) / 255.0
+            if not np.isfinite(image_array).all():
+                raise ValueError("Raw float32 image payload contains non-finite values")
+            if image_array.min() < 0.0 or image_array.max() > 255.0:
+                raise ValueError("Raw float32 image values must be in [0, 1] or [0, 255]")
+            image_array = image_array.reshape(side, side, channels)
+            if image_array.max() > 1.0:
+                image_array = image_array / 255.0
         else:
             raise ValueError(f"Unknown image encoding: {camera_image.encoding}")
 
-        # Convert to (C, H, W) tensor
-        image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).unsqueeze(0)
+        image_tensor = rearrange(torch.from_numpy(image_array.copy()), "h w c -> 1 c h w")
         return image_tensor.to(device=self.device, dtype=self.dtype)
 
     def _prepare_observation(
