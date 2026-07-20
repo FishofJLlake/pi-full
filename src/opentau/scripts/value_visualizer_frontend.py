@@ -165,6 +165,8 @@ def build_value_scrubber_html(
   .vv-image-shell {{
     display: grid;
     place-items: center;
+    width: 100%;
+    height: 100%;
     min-height: 560px;
     background: #f6f8fb;
   }}

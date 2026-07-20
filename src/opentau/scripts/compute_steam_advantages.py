@@ -372,6 +372,12 @@ def validate_checkpoint_count(checkpoints: list[Path]) -> None:
             "STEAM advantage generation requires exactly three independent "
             f"checkpoints; got {len(checkpoints)}."
         )
+    canonical_paths = {checkpoint.resolve() for checkpoint in checkpoints}
+    if len(canonical_paths) != 3:
+        raise ValueError(
+            "STEAM ensemble checkpoints must be three distinct paths; "
+            f"got {checkpoints!r}."
+        )
 
 
 def main(args: argparse.Namespace) -> None:

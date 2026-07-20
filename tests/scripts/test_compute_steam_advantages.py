@@ -41,6 +41,8 @@ def test_exactly_three_checkpoints_are_required():
     for count in (0, 1, 2, 4):
         with pytest.raises(ValueError, match="exactly three"):
             validate_checkpoint_count([Path(str(index)) for index in range(count)])
+    with pytest.raises(ValueError, match="three distinct paths"):
+        validate_checkpoint_count([Path("same"), Path("same"), Path("same")])
 
 
 def test_main_continues_into_dataset_collection_after_checkpoint_validation(monkeypatch):

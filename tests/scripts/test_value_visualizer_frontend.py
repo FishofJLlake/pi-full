@@ -164,6 +164,9 @@ class ValueVisualizerFrontendTest(unittest.TestCase):
         self.assertIn("height: 100%;", html)
         self.assertIn("object-fit: contain;", html)
         self.assertNotIn("object-fit: cover;", html)
+        shell_css = html.split(".vv-image-shell {", 1)[1].split("}", 1)[0]
+        self.assertIn("width: 100%;", shell_css)
+        self.assertIn("height: 100%;", shell_css)
 
 
 if __name__ == "__main__":
