@@ -137,6 +137,16 @@ class PI05Config(PreTrainedConfig):
     # Real Time Inference
     # maximum number of frozen actions
     max_delay: int = 0
+    delay_sampling: Literal["uniform", "exponential"] = "uniform"
+    delay_exponential_decay: float = 1.0
+
+    # Advantage conditioning. Disabled by default to preserve existing prompts.
+    advantage: Literal["ignore", "use"] = "ignore"
+    advantage_threshold: float = 0.0
+
+    # Classifier-free guidance. Defaults preserve the current forward path.
+    cfg_dropout: float = 0.0
+    guidance_scale: float = 1.0
 
     # Modality-specific learnable embedding.
     # When True, a learnable embedding selected by input modality (vision,
@@ -222,6 +232,30 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
             )
+        if self.delay_sampling not in ("uniform", "exponential"):
+            raise ValueError(
+                "`delay_sampling` must be one of ['uniform', 'exponential']. "
+                f"Got {self.delay_sampling}."
+            )
+        if self.delay_exponential_decay <= 0:
+            raise ValueError(
+                "`delay_exponential_decay` must be greater than 0. "
+                f"Got {self.delay_exponential_decay}."
+            )
+        if not 0.0 <= self.cfg_dropout <= 1.0:
+            raise ValueError(
+                f"`cfg_dropout` must be in the interval [0, 1]. Got {self.cfg_dropout}."
+            )
+        if self.advantage_threshold < 0.0:
+            raise ValueError(
+                f"`advantage_threshold` must be non-negative. Got {self.advantage_threshold}."
+            )
+        if self.advantage not in ("ignore", "use"):
+            raise ValueError(
+                f"advantage must be one of ['ignore', 'use']. Got {self.advantage!r}."
+            )
+        if self.guidance_scale < 0.0:
+            raise ValueError(f"`guidance_scale` must be non-negative. Got {self.guidance_scale}.")
 
         if self.n_action_steps < self.chunk_size and self.max_delay != 0:
             raise ValueError(

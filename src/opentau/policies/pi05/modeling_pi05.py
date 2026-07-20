@@ -238,6 +238,32 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
+def sample_training_delay(config: PI05Config, batch_size: int) -> Tensor:
+    """Sample per-example training delays with the configured discrete law.
+
+    Uniform sampling intentionally uses the same `torch.randint` call shape as
+    the existing implementation. Exponential sampling assigns delay `d`
+    probability proportional to `exp(-decay * d)`.
+    """
+    if config.delay_sampling == "uniform":
+        return torch.randint(0, config.max_delay + 1, (batch_size,))
+    if config.delay_sampling == "exponential":
+        delays = torch.arange(config.max_delay + 1, dtype=torch.float32)
+        weights = torch.exp(-config.delay_exponential_decay * delays)
+        return torch.multinomial(weights, batch_size, replacement=True)
+    raise ValueError(
+        "`delay_sampling` must be one of ['uniform', 'exponential']. "
+        f"Got {config.delay_sampling}."
+    )
+
+
+def apply_classifier_free_guidance(
+    v_cond: Tensor, v_uncond: Tensor, guidance_scale: float
+) -> Tensor:
+    """Combine paired conditional and unconditional velocity predictions."""
+    return v_uncond + guidance_scale * (v_cond - v_uncond)
+
+
 class PI05Policy(PreTrainedPolicy):
     """Wrapper class around PI05FlowMatching model to train and run inference within OpenTau."""
 
@@ -647,6 +673,24 @@ class PI05Policy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
+        bsize = lang_tokens.shape[0]
+        state = self.prepare_state(batch) if self.config.state_type == "continuous" else None
+
+        use_cfg = (
+            not self.training
+            and self.config.advantage == "use"
+            and self.config.guidance_scale != 1.0
+        )
+        if use_cfg:
+            lang_tokens_uncond, lang_masks_uncond = self.prepare_language(
+                batch, force_uncond=True
+            )
+            lang_tokens = torch.cat([lang_tokens, lang_tokens_uncond], dim=0)
+            lang_masks = torch.cat([lang_masks, lang_masks_uncond], dim=0)
+            images = [torch.cat([image, image], dim=0) for image in images]
+            img_masks = [torch.cat([mask, mask], dim=0) for mask in img_masks]
+            if state is not None:
+                state = torch.cat([state, state], dim=0)
 
         # if delay is not provided, set it to 0
         if delay is None:
@@ -654,7 +698,6 @@ class PI05Policy(PreTrainedPolicy):
 
         if action_prefix is None:
             # create a zero filled action_prefix
-            bsize = lang_tokens.shape[0]
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
         else:
@@ -665,8 +708,6 @@ class PI05Policy(PreTrainedPolicy):
                 (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
             )
 
-        state = self.prepare_state(batch) if self.config.state_type == "continuous" else None
-
         actions = self.model.sample_actions(
             images,
             img_masks,
@@ -676,6 +717,7 @@ class PI05Policy(PreTrainedPolicy):
             delay,
             noise=noise,
             state=state,
+            guidance_scale=self.config.guidance_scale if use_cfg else 1.0,
         )
 
         # Unpad actions
@@ -903,32 +945,65 @@ class PI05Policy(PreTrainedPolicy):
 
         return images, img_masks
 
-    def prepare_language(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Tokenize the text input.
-
-        When ``state_type == "discrete"``, the state is discretized into bins and
-        embedded into the prompt string.  When ``state_type == "continuous"``, the
-        state is handled separately via :meth:`prepare_state`, so the prompt only
-        contains the task description.
-
-        Args:
-            batch: Batch of data containing the key "prompt" and "state".
-
-        Returns:
-            A tuple containing:
-                - lang_tokens: Tensor of language tokens.
-                - lang_masks: Tensor of language attention masks.
-        """
+    def prepare_language(
+        self, batch: dict[str, Tensor], *, force_uncond: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        """Tokenize the task, optional advantage condition, and discrete state."""
         device = batch["state"].device
-        tasks = batch["prompt"]
+        tasks = list(batch["prompt"])
+
+        if self.config.advantage == "use":
+            if "advantage" in batch:
+                advantage_values = (
+                    torch.as_tensor(batch["advantage"], dtype=torch.float32)
+                    .reshape(-1)
+                    .cpu()
+                    .tolist()
+                )
+                if len(advantage_values) != len(tasks):
+                    raise ValueError(
+                        "The advantage batch must have one value per prompt. "
+                        f"Got {len(advantage_values)} values for {len(tasks)} prompts."
+                    )
+            elif self.training:
+                advantage_values = [0.0] * len(tasks)
+            else:
+                # Missing inference-time advantages intentionally request the
+                # high-quality branch.
+                advantage_values = [None] * len(tasks)
+
+            if self.training and not force_uncond and self.config.cfg_dropout > 0.0:
+                drop_condition = (
+                    torch.rand(len(tasks), device=device) < self.config.cfg_dropout
+                ).cpu().tolist()
+            else:
+                drop_condition = [False] * len(tasks)
+
+            labels = []
+            threshold = self.config.advantage_threshold
+            for value, dropped in zip(advantage_values, drop_condition, strict=True):
+                if force_uncond or dropped:
+                    label = "none"
+                elif value is None or value > threshold:
+                    label = "positive"
+                elif value < -threshold:
+                    label = "negative"
+                else:
+                    label = "none"
+                labels.append(label)
+            tasks = [
+                f"{task} Advantage: {label}"
+                for task, label in zip(tasks, labels, strict=True)
+            ]
 
         if self.config.state_type == "continuous":
             prompt = [f"Task: {task}, " for task in tasks]
         else:
-            # add state to the prompt
             state = self.prepare_discrete_state(batch)
-            # using <eos> to separate each modality
-            prompt = [f"Task: {task}, State: {state};\n" for task, state in zip(tasks, state, strict=False)]
+            prompt = [
+                f"Task: {task}, State: {state};\n"
+                for task, state in zip(tasks, state, strict=False)
+            ]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -940,7 +1015,6 @@ class PI05Policy(PreTrainedPolicy):
         )
         lang_tokens = tokenized_prompt["input_ids"].to(device=device)
         lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
-
         return lang_tokens, lang_masks
 
     def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
@@ -1464,7 +1538,7 @@ class PI05FlowMatching(nn.Module):
             time = self.sample_time(batch_size, actions.device)
 
         # handle real time inference delay
-        delay = torch.randint(0, self.config.max_delay + 1, (batch_size,))
+        delay = sample_training_delay(self.config, batch_size)
         prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(
             delay, "b -> b 1"
         )
@@ -1539,7 +1613,8 @@ class PI05FlowMatching(nn.Module):
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape
         discrete_token_start = -self.config.discrete_action_max_length
-        # The last token of response will predict the first token of discrete actions , so we need to slice from discrete_token_start -1.
+        # The final always-valid "Action: " indicator token predicts the first
+        # discrete action token, so the slice starts one position earlier.
         # The predicted last token of discrete action is useless, so no need to include for loss calculation.
         discrete_action_slice_object = slice(discrete_token_start - 1, -1)
         discrete_action_out = prefix_out[:, discrete_action_slice_object]
@@ -1573,7 +1648,8 @@ class PI05FlowMatching(nn.Module):
                 - self.config.discrete_action_indicator_max_length
             )
             # The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.discrete_action_max_length - self.config.response_max_length.
-            # The last token of response predicts first token  of discrete actions, so no need to include for loss calculation. Hence slice ends at -self.config.discrete_action_max_length - 1.
+            # Response loss ends before the "Action: " indicator and discrete
+            # action section.
             response_token_end = (
                 -self.config.discrete_action_max_length - self.config.discrete_action_indicator_max_length - 1
             )
@@ -1634,6 +1710,7 @@ class PI05FlowMatching(nn.Module):
         delay: Tensor,
         noise: Tensor | None = None,
         state: Tensor | None = None,
+        guidance_scale: float = 1.0,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -1646,12 +1723,18 @@ class PI05FlowMatching(nn.Module):
             delay: Number of delay actions, aka number of actions frozen from the action_prefix.
             noise: Optional noise tensor.
             state: Optional continuous state tensor of shape (batch_size, max_state_dim).
+            guidance_scale: Classifier-free guidance scale for the paired batch.
             indicator_tokens: Optional indicator token tensor.
             indicator_masks: Optional indicator mask tensor.
         Returns:
             The sampled action tensor.
         """
-        bsize = lang_tokens.shape[0]
+        prefix_bsize = lang_tokens.shape[0]
+        use_cfg = guidance_scale != 1.0
+        if use_cfg and prefix_bsize % 2:
+            raise ValueError("CFG inference expects paired conditional and unconditional batches.")
+        bsize = prefix_bsize // 2 if use_cfg else prefix_bsize
+
         device = lang_tokens.device
 
         if noise is None:
@@ -1684,7 +1767,7 @@ class PI05FlowMatching(nn.Module):
         )
 
         # initialize response tokens to empty tensor for storing response tokens during inference
-        response_tokens = torch.empty((bsize, 0), device=device, dtype=torch.long)
+        response_tokens = torch.empty((prefix_bsize, 0), device=device, dtype=torch.long)
         # if response prediction is enabled, then predict response tokens autoregressively
         if self.config.predict_response:
             for auto_step in range(self.config.response_max_length):
@@ -1705,7 +1788,7 @@ class PI05FlowMatching(nn.Module):
                     prefix_offsets,
                     response_tokens,
                     auto_step,
-                    bsize,
+                    prefix_bsize,
                     device,
                 )
 
@@ -1716,20 +1799,39 @@ class PI05FlowMatching(nn.Module):
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
+        if prefix_mask.shape[0] == 1 and bsize > 1:
+            prefix_mask = prefix_mask.expand(bsize, -1)
         while time >= -dt / 2:
             # if delay is greater than 0, then freeze the action prefix at the beginning of action chunk
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
-            masked_time = torch.where(prefix_mask, 0, time)
-            v_t = self.denoise_step(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                masked_time,
+            masked_time = torch.where(
+                prefix_mask,
+                torch.zeros((), dtype=time.dtype, device=device),
+                time,
             )
 
+            if use_cfg:
+                x_t_batched = torch.cat([x_t, x_t], dim=0)
+                masked_time_batched = torch.cat([masked_time, masked_time], dim=0)
+                v_batched = self.denoise_step(
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t_batched,
+                    masked_time_batched,
+                )
+                v_cond, v_uncond = v_batched.chunk(2, dim=0)
+                v_t = apply_classifier_free_guidance(v_cond, v_uncond, guidance_scale)
+            else:
+                v_t = self.denoise_step(
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    masked_time,
+                )
+
             # Euler step
-            x_t += dt * v_t
-            time += dt
+            x_t = x_t + dt * v_t
+            time = time + dt
 
         # we need to ensure the frozen actions are not modified before returning the denoised actions
         x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
