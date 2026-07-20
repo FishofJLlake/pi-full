@@ -216,6 +216,7 @@ DATA_FEATURES_NAME_MAPPING = {
         "actions": "action",
         "prompt": "task",
         "response": "response",
+        "intervention": "human_intervention",
     },
     "dummy": {
         "camera0": "image",

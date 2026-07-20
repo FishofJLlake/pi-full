@@ -24,4 +24,5 @@ def test_realman_dualarm_feature_mapping() -> None:
         "actions": "action",
         "prompt": "task",
         "response": "response",
+        "intervention": "human_intervention",
     }
