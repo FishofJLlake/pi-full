@@ -174,6 +174,8 @@ class TrainPipelineConfig(HubMixin):
     # Prefetch factor for the dataloader.
     prefetch_factor: int | None = None
     steps: int = 100_000
+    # Optional replicated-training EMA; disabled by default.
+    ema_decay: float | None = None
     log_freq: int = 200
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
@@ -229,6 +231,11 @@ class TrainPipelineConfig(HubMixin):
         assert (
             self.batch_size >= 1 and self.gradient_accumulation_steps >= 1 and self.dataloader_batch_size >= 1
         )
+
+        if self.ema_decay is not None and not 0.0 <= self.ema_decay < 1.0:
+            raise ValueError(
+                f"`ema_decay` must be None or in the interval [0, 1). Got {self.ema_decay}."
+            )
 
         if self.policy:
             self.policy.max_state_dim = self.max_state_dim

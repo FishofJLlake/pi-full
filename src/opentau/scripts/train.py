@@ -42,6 +42,7 @@ from opentau.datasets.factory import make_dataset_mixture
 from opentau.datasets.utils import cycle
 from opentau.envs.factory import make_envs
 from opentau.envs.utils import close_envs
+from opentau.optim.ema import NamedParameterEMA
 from opentau.optim.factory import make_optimizer_and_scheduler
 from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
@@ -225,6 +226,7 @@ def update_policy(
     grad_clip_norm: float,
     accelerator: accelerate.Accelerator,
     lr_scheduler: AcceleratedScheduler | None = None,
+    ema: NamedParameterEMA | None = None,
 ) -> tuple[MetricsTracker, dict]:
     policy.train()
     losses = policy.forward(batch)
@@ -252,6 +254,9 @@ def update_policy(
             train_metrics.grad_norm = grad_norm
 
     optimizer.step()
+    if ema is not None and accelerator.sync_gradients and not getattr(optimizer, "step_was_skipped", False):
+        ema.update()
+
     optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
@@ -705,6 +710,24 @@ def _sync_deepspeed_gradient_accumulation_steps(
     accelerator.deepspeed_plugin.gradient_accumulation_steps = target
 
 
+def _validate_ema_backend(
+    ema_decay: float | None, distributed_type: accelerate.DistributedType
+) -> None:
+    """Reject EMA before model construction on parameter-sharded backends."""
+    if ema_decay is None:
+        return
+    supported = {
+        accelerate.DistributedType.NO,
+        accelerate.DistributedType.MULTI_CPU,
+        accelerate.DistributedType.MULTI_GPU,
+    }
+    if distributed_type not in supported:
+        raise ValueError(
+            "ema_decay is currently supported only for single-process and replicated DDP "
+            f"training; got distributed_type={distributed_type}."
+        )
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
@@ -735,6 +758,7 @@ def train(cfg: TrainPipelineConfig):
         accelerator_kwargs["log_with"] = "wandb"
 
     accelerator = accelerate.Accelerator(**accelerator_kwargs)
+    _validate_ema_backend(cfg.ema_decay, accelerator.distributed_type)
     # ``cfg.output_dir`` embeds a per-process wall-clock timestamp (assigned in
     # ``TrainPipelineConfig`` as ``f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{job_name}"``) and every
     # rank parses the config independently, so a launch whose startup straddles a one-second
@@ -1017,8 +1041,15 @@ def train(cfg: TrainPipelineConfig):
         inner_opt_for_migrate.rebuild_masters_from_live(policy.parameters())
     train_dl_iter = cycle(train_dataloader)
 
+    ema = (
+        NamedParameterEMA(accelerator.unwrap_model(policy), cfg.ema_decay)
+        if cfg.ema_decay is not None
+        else None
+    )
     # Register the LR scheduler for checkpointing
     accelerator.register_for_checkpointing(lr_scheduler)
+    if ema is not None:
+        accelerator.register_for_checkpointing(ema)
 
     # When `save_normalization_stats=False`, strip the per-feature Normalize /
     # Unnormalize buffers from each model state_dict that Accelerate is about
@@ -1147,6 +1178,7 @@ def train(cfg: TrainPipelineConfig):
                     cfg.optimizer.grad_clip_norm,
                     accelerator=accelerator,
                     lr_scheduler=lr_scheduler,
+                    ema=ema,
                 )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -1266,7 +1298,7 @@ def train(cfg: TrainPipelineConfig):
 
             logging.info(f"Validation at step {step}...")
 
-            with torch.no_grad():
+            with torch.no_grad(), ema.average_parameters() if ema is not None else nullcontext():
                 for batch in val_dataloader:
                     losses = (
                         policy.forward(batch, return_per_sample=True)
@@ -1451,7 +1483,8 @@ def train(cfg: TrainPipelineConfig):
             logging.info(f"Eval policy at step {step}")
             # Build eval envs, run eval, then tear them down so the sim renderer's
             # GPU memory is freed before training resumes (see _eval_with_fresh_envs).
-            eval_info = _eval_with_fresh_envs(cfg, policy, accelerator, eval_subgoal_generator, step_id)
+            with ema.average_parameters() if ema is not None else nullcontext():
+                eval_info = _eval_with_fresh_envs(cfg, policy, accelerator, eval_subgoal_generator, step_id)
 
             eval_info = gather_object([eval_info])  # gather across all accelerator processes
             if accelerator.is_main_process:
