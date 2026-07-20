@@ -62,7 +62,7 @@ Example:
 
 import copy
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -82,9 +82,14 @@ from opentau.datasets.lerobot_dataset import (
     LeRobotDatasetMetadata,
     suppress_control_mode_warning,
 )
+from opentau.datasets.steam_pair_dataset import (
+    SteamPairDataset,
+    set_global_length_reference,
+)
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, feature_mapping_key
 from opentau.datasets.transforms import ImageTransforms
 from opentau.datasets.utils import DeltaTimestampInfo
+from opentau.policies.steam.configuration_steam import SteamConfig
 
 IMAGENET_STATS = {
     "min": [[[0.0]], [[0.0]], [[0.0]]],  # (c,1,1)
@@ -210,6 +215,8 @@ def make_dataset(
     cfg: DatasetConfig,
     train_cfg: TrainPipelineConfig,
     return_advantage_input: bool = False,
+    local_files_only: bool = False,
+    steam_mode: Literal["training", "inference"] = "training",
 ) -> Union[BaseDataset, Tuple[BaseDataset, BaseDataset]]:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
@@ -233,6 +240,14 @@ def make_dataset(
         BaseDataset or Tuple[BaseDataset, BaseDataset]: A single dataset or a tuple of (train_dataset, val_dataset) if val_freq > 0.
     """
     image_transforms = ImageTransforms(cfg.image_transforms) if cfg.image_transforms.enable else None
+    if isinstance(train_cfg.policy, SteamConfig):
+        if isinstance(cfg.vqa, str):
+            raise ValueError("STEAM only supports trajectory datasets, not VQA datasets.")
+        if steam_mode == "training" and cfg.steam_source != "expert":
+            raise ValueError(
+                "STEAM critic training only accepts expert trajectories; set "
+                "dataset.steam_source='expert'."
+            )
 
     if isinstance(cfg.vqa, str) + isinstance(cfg.repo_id, str) != 1:
         raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
@@ -246,7 +261,9 @@ def make_dataset(
         # TODO support dataset-specific arg / kwargs
         dataset = ds_cls(train_cfg)
     elif isinstance(cfg.repo_id, str):
-        ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
+        ds_meta = LeRobotDatasetMetadata(
+            cfg.repo_id, root=cfg.root, revision=cfg.revision, local_files_only=local_files_only
+        )
         dt_mean, dt_std, dt_lower, dt_upper = resolve_delta_timestamps(train_cfg, cfg, ds_meta)
         # Suppress the "missing control_mode" warning when the user is
         # providing an explicit override — they already know it's missing.
@@ -284,6 +301,7 @@ def make_dataset(
             skip_timestamp_check=effective_skip,
             prompt_substitutions=cfg.prompt_substitutions,
             data_features_name_mapping=cfg.data_features_name_mapping,
+            local_files_only=local_files_only,
         )
     else:
         raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
@@ -304,6 +322,9 @@ def make_dataset(
                 if key not in dataset.meta.stats:
                     dataset.meta.stats[key] = {}
                 dataset.meta.stats[key][stats_type] = np.array(stats, dtype=np.float32)
+
+    if isinstance(train_cfg.policy, SteamConfig):
+        dataset = SteamPairDataset(dataset, train_cfg.policy, mode=steam_mode)
 
     if train_cfg.val_freq > 0:
         # Per-dataset value wins over the mixture-wide default; `None` means
@@ -433,6 +454,11 @@ def make_dataset_mixture(
     _validate_metadata_requirements(cfg, datasets, label="train")
     if val_datasets:
         _validate_metadata_requirements(cfg, val_datasets, label="val")
+    if isinstance(cfg.policy, SteamConfig):
+        set_global_length_reference(
+            datasets + val_datasets,
+            cfg.policy.length_reference_percentile,
+        )
 
     train_weights = _resolve_weights(cfg.dataset_mixture.weights, datasets, label="train")
     train_mixture = WeightedDatasetMixture(cfg, datasets, train_weights, cfg.dataset_mixture.action_freq)

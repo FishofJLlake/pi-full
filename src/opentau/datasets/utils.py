@@ -77,6 +77,8 @@ import contextlib
 import importlib.resources
 import json
 import logging
+import math
+import operator
 from collections.abc import Iterable, Iterator
 from itertools import accumulate
 from pathlib import Path
@@ -108,10 +110,16 @@ from opentau.utils.utils import is_valid_numpy_dtype_string
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of episodes per chunk
 
+AdvantageKey = tuple[int, int]
+
 ADVANTAGES_PATH = "meta/advantages.json"
+RAW_ADVANTAGES_PATH = "meta/raw_advantages.json"
+ADVANTAGE_SOURCES_PATH = "meta/advantage_sources.json"
+ADVANTAGE_REPORT_PATH = "meta/advantage_report.json"
 INFO_PATH = "meta/info.json"
 EPISODES_PATH = "meta/episodes.jsonl"
 STATS_PATH = "meta/stats.json"
+STATS_QUANTILES_PATH = "meta/stats_quantiles.json"
 EPISODES_STATS_PATH = "meta/episodes_stats.jsonl"
 TASKS_PATH = "meta/tasks.jsonl"
 
@@ -442,23 +450,176 @@ def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]] | None:
     return cast_stats_to_numpy(stats)
 
 
-def load_advantages(local_dir: Path) -> dict | None:
-    """Load advantage values from the advantages.json file.
-
-    Advantages are keyed by (episode_index, timestamp) tuples in the JSON file
-    as comma-separated strings, which are converted to tuple keys.
-
-    Args:
-        local_dir: Root directory of the dataset containing meta/advantages.json.
-
-    Returns:
-        Dictionary mapping (episode_index, timestamp) tuples to advantage values,
-        or None if the file doesn't exist.
-    """
-    if not (local_dir / ADVANTAGES_PATH).exists():
+def load_stats_quantiles(local_dir: Path) -> dict[str, dict[str, np.ndarray]] | None:
+    """Load optional q01/q99 sidecar statistics."""
+    path = local_dir / STATS_QUANTILES_PATH
+    if not path.exists():
         return None
-    advantages = load_json(local_dir / ADVANTAGES_PATH)
-    return {(int(k.split(",")[0]), float(k.split(",")[1])): float(v) for k, v in advantages.items()}
+    return cast_stats_to_numpy(load_json(path))
+
+
+def merge_missing_stats_quantiles(
+    stats: dict[str, dict[str, np.ndarray]] | None,
+    sidecar: dict[str, dict[str, np.ndarray]] | None,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Add only missing q01/q99 entries from an optional sidecar."""
+    merged_stats = {} if stats is None else stats
+    if sidecar is None:
+        return merged_stats
+    for feature_name, feature_sidecar in sidecar.items():
+        feature_stats = merged_stats.setdefault(feature_name, {})
+        for quantile_name in ("q01", "q99"):
+            if quantile_name in feature_sidecar:
+                feature_stats.setdefault(quantile_name, feature_sidecar[quantile_name])
+    return merged_stats
+
+
+def serialize_advantage_key(episode_index: int, frame_index: int) -> str:
+    """Serialize a canonical non-negative integer advantage key."""
+    episode_index = operator.index(episode_index)
+    frame_index = operator.index(frame_index)
+    if episode_index < 0 or frame_index < 0:
+        raise ValueError("Advantage indices must be non-negative")
+    return f"{episode_index},{frame_index}"
+
+
+def parse_advantage_key(serialized: str) -> AdvantageKey:
+    """Parse ``episode_index,frame_index`` and reject timestamp-era keys."""
+    parts = serialized.split(",")
+    if len(parts) != 2 or any(not part.isdecimal() for part in parts):
+        raise ValueError(
+            f"Expected integer frame key 'episode_index,frame_index'; got {serialized!r}. "
+            "Regenerate timestamp-keyed advantage files."
+        )
+    key = (int(parts[0]), int(parts[1]))
+    if serialize_advantage_key(*key) != serialized:
+        raise ValueError(f"Noncanonical integer frame key: {serialized!r}")
+    return key
+
+
+def load_advantages(local_dir: Path) -> dict[AdvantageKey, float] | None:
+    """Load finite advantage values keyed by canonical integer frame keys."""
+    path = local_dir / ADVANTAGES_PATH
+    if not path.exists():
+        return None
+    return load_advantages_from_path(path)
+
+
+def load_advantages_from_path(
+    path: Path,
+    value_name: str = "advantage",
+) -> dict[AdvantageKey, float]:
+    """Load one finite frame-keyed numeric mapping from an explicit path."""
+
+    class JSONObjectPairs(list):
+        pass
+
+    with open(path, encoding="utf-8") as file:
+        serialized_values = json.loads(file.read(), object_pairs_hook=JSONObjectPairs)
+    if not isinstance(serialized_values, JSONObjectPairs):
+        raise ValueError(f"Expected {path.name} to contain a JSON object")
+
+    seen: set[str] = set()
+    result: dict[AdvantageKey, float] = {}
+    for serialized, value in serialized_values:
+        if serialized in seen:
+            raise ValueError(f"Duplicate {value_name} key: {serialized!r}")
+        seen.add(serialized)
+        key = parse_advantage_key(serialized)
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{value_name.title()} value for {serialized!r} must be finite; got {value!r}"
+            ) from exc
+        if not math.isfinite(numeric_value):
+            raise ValueError(
+                f"{value_name.title()} value for {serialized!r} must be finite; got {value!r}"
+            )
+        result[key] = numeric_value
+    return result
+
+
+def load_advantage_sources_from_path(path: Path) -> dict[AdvantageKey, str]:
+    """Load one frame-keyed source mapping while preserving duplicate detection."""
+
+    class JSONObjectPairs(list):
+        pass
+
+    with open(path, encoding="utf-8") as file:
+        serialized_sources = json.loads(file.read(), object_pairs_hook=JSONObjectPairs)
+    if not isinstance(serialized_sources, JSONObjectPairs):
+        raise ValueError(f"Expected {path.name} to contain a JSON object")
+
+    result: dict[AdvantageKey, str] = {}
+    seen: set[str] = set()
+    for serialized, source in serialized_sources:
+        if serialized in seen:
+            raise ValueError(f"Duplicate advantage source key: {serialized!r}")
+        seen.add(serialized)
+        key = parse_advantage_key(serialized)
+        if not isinstance(source, str) or not source:
+            raise ValueError(
+                f"Advantage source for {serialized!r} must be a non-empty string; got {source!r}"
+            )
+        result[key] = source
+    return result
+
+
+def validate_advantage_bundle_files(
+    local_dir: Path,
+    advantages: dict[AdvantageKey, float] | None,
+) -> None:
+    """Validate companion files for an advantage bundle used by conditioning."""
+    if advantages is None:
+        raise ValueError(
+            f"Missing {ADVANTAGES_PATH}; regenerate the complete advantage bundle."
+        )
+
+    companion_paths = {
+        "raw_advantages": local_dir / RAW_ADVANTAGES_PATH,
+        "advantage_sources": local_dir / ADVANTAGE_SOURCES_PATH,
+        "advantage_report": local_dir / ADVANTAGE_REPORT_PATH,
+    }
+    missing_files = [str(path) for path in companion_paths.values() if not path.exists()]
+    if missing_files:
+        raise ValueError(
+            "Advantage conditioning requires a complete four-file bundle; missing "
+            f"{missing_files!r}. Regenerate all advantage files."
+        )
+
+    raw_advantages = load_advantages_from_path(
+        companion_paths["raw_advantages"], "raw advantage"
+    )
+    sources = load_advantage_sources_from_path(companion_paths["advantage_sources"])
+
+    expected_keys = set(advantages)
+    for name, keys in {
+        "raw_advantages": set(raw_advantages),
+        "advantage_sources": set(sources),
+    }.items():
+        if keys != expected_keys:
+            missing = sorted(expected_keys - keys)
+            unexpected = sorted(keys - expected_keys)
+            raise ValueError(
+                f"Advantage bundle key sets differ for {name}: "
+                f"missing={missing!r}, unexpected={unexpected!r}"
+            )
+
+    report = load_json(companion_paths["advantage_report"])
+    expected_count = len(expected_keys)
+    if (
+        not isinstance(report, dict)
+        or report.get("schema_version") != 1
+        or report.get("key_format") != "episode_index,frame_index"
+        or report.get("processed_count") != expected_count
+        or report.get("written_count") != expected_count
+        or report.get("coverage") != 1.0
+    ):
+        raise ValueError(
+            "advantage_report.json does not describe a complete frame-index bundle; "
+            "regenerate all advantage files."
+        )
 
 
 def write_task(task_index: int, task: dict, local_dir: Path) -> None:

@@ -56,6 +56,8 @@ Constants:
           aggregate in episodes_stats, v2.1+) and inverted into "mistake"
           when no mistake column exists; also drives the value-function
           return bins
+        - "intervention": Explicit per-frame human-intervention signal. It has
+          no default column and is never derived from "mistake" or "success".
 
 Example:
     Access feature name mapping for a dataset:

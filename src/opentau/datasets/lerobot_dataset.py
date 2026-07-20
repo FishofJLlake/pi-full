@@ -145,8 +145,11 @@ from opentau.datasets.utils import (
     load_episodes_stats,
     load_info,
     load_stats,
+    load_stats_quantiles,
     load_tasks,
     load_tasks_v30,
+    merge_missing_stats_quantiles,
+    validate_advantage_bundle_files,
     validate_episode_buffer,
     validate_frame,
     write_episode,
@@ -370,7 +373,7 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         episodes: Dictionary mapping episode_index to episode information.
         tasks: Dictionary mapping task_index to task descriptions.
         task_to_task_index: Reverse mapping from task description to task_index.
-        advantages: Dictionary mapping (episode_index, timestamp) to advantage values.
+        advantages: Dictionary mapping (episode_index, frame_index) to advantage values.
 
     Example:
         Load metadata from Hub:
@@ -391,11 +394,24 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         root: str | Path | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
+        local_files_only: bool = False,
     ):
         super().__init__()
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
         self.root = Path(root) if root is not None else HF_OPENTAU_HOME / repo_id
+        if local_files_only:
+            if not self.root.is_dir():
+                raise FileNotFoundError(
+                    f"Local-only dataset metadata requires existing root for {repo_id!r}: {self.root}"
+                )
+            try:
+                self.load_metadata()
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                raise FileNotFoundError(
+                    f"Local-only dataset metadata is incomplete under {self.root} for {repo_id!r}"
+                ) from exc
+            return
 
         try:
             if force_cache_sync:
@@ -450,6 +466,10 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             else:
                 self.episodes_stats = load_episodes_stats(self.root)
                 self.stats = aggregate_stats(list(self.episodes_stats.values()))
+
+        # The optional sidecar only supplies missing robust quantiles; it never
+        # overrides statistics already embedded in the authoritative stats payload.
+        self.stats = merge_missing_stats_quantiles(self.stats, load_stats_quantiles(self.root))
 
         self.advantages = load_advantages(self.root)
 
@@ -978,7 +998,7 @@ class BaseDataset(torch.utils.data.Dataset):
             # across a mixture requires every dataset to emit the same keys.
             # They are resolved in `__getitem__` (`_attach_mistake_raw`) and
             # emitted uniformly by `_emit_optional_keys` instead.
-            if "camera" in new_key or new_key in ("mistake", "success"):
+            if "camera" in new_key or new_key in ("mistake", "success", "intervention"):
                 continue
             standard_item[new_key] = item[key]
 
@@ -1045,6 +1065,22 @@ class BaseDataset(torch.utils.data.Dataset):
         standard_item["frame_index"] = int(fr.item() if torch.is_tensor(fr) else fr) if fr is not None else -1
 
         return standard_item
+
+    @staticmethod
+    def _emit_intervention(item: dict, standard_item: dict) -> None:
+        """Emit the independent intervention value and its availability mask."""
+        intervention_raw = item.get("intervention_raw")
+        if intervention_raw is None:
+            standard_item["intervention"] = torch.tensor(False, dtype=torch.bool)
+            standard_item["intervention_is_pad"] = torch.tensor(True)
+        else:
+            intervention_value = float(intervention_raw)
+            if not math.isfinite(intervention_value):
+                raise ValueError(
+                    f"Mapped intervention value must be finite; got {intervention_raw!r}."
+                )
+            standard_item["intervention"] = torch.tensor(intervention_value > 0, dtype=torch.bool)
+            standard_item["intervention_is_pad"] = torch.tensor(False)
 
     def _emit_optional_keys(self, item: dict, standard_item: dict) -> None:
         """Emit optional memory/subgoal/metadata keys with training-time dropout.
@@ -1161,6 +1197,10 @@ class BaseDataset(torch.utils.data.Dataset):
         next_memory_raw = item.get("next_memory_raw")
         standard_item["next_memory"] = next_memory_raw if isinstance(next_memory_raw, str) else ""
 
+        # Intervention is a dedicated, explicitly mapped per-frame role. It is
+        # never derived from mistake/success and never participates in metadata
+        # dropout because advantage generation must see the authoritative label.
+        self._emit_intervention(item, standard_item)
         # (5) Metadata drops: numeric fields get a _is_pad flag; string
         # identifier fields use "" as the pad signal (no separate flag).
         drop_meta_all = _roll(self.metadata_drop_all_prob)
@@ -1402,6 +1442,7 @@ class LeRobotDataset(BaseDataset):
         skip_timestamp_check: bool = False,
         prompt_substitutions: dict[str, list[str]] | None = None,
         data_features_name_mapping: dict[str, str] | None = None,
+        local_files_only: bool = False,
     ):
         """Initialize LeRobotDataset.
 
@@ -1605,14 +1646,23 @@ class LeRobotDataset(BaseDataset):
         self.episode_buffer = None
         self.skip_video_stats = False
 
-        self.root.mkdir(exist_ok=True, parents=True)
+        if local_files_only and not self.root.is_dir():
+            raise FileNotFoundError(
+                f"Local-only dataset requires existing root for {self.repo_id!r}: {self.root}"
+            )
+        if not local_files_only:
+            self.root.mkdir(exist_ok=True, parents=True)
 
         # Load metadata. Forward the *original* `revision` (may be None), not the
         # `CODEBASE_VERSION`-coerced `self.revision`: the metadata constructor
         # applies the default itself and must see an unset revision to enable its
         # main/master branch fallback for untagged repos.
         self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, revision, force_cache_sync=force_cache_sync
+            self.repo_id,
+            self.root,
+            revision,
+            force_cache_sync=force_cache_sync,
+            local_files_only=local_files_only,
         )
 
         # Resolve config-time prompt substitutions once against the on-disk
@@ -1667,6 +1717,11 @@ class LeRobotDataset(BaseDataset):
             src_info_path = src_root / INFO_PATH
             if not src_info_path.is_file():
                 acc = get_proc_accelerator()
+                if local_files_only:
+                    raise FileNotFoundError(
+                        f"Local-only overlay dataset {self.repo_id!r} requires cached source "
+                        f"metadata at {src_info_path}"
+                    )
                 if acc is not None and acc.num_processes > 1:
                     if acc.is_main_process:
                         src_info_path.parent.mkdir(exist_ok=True, parents=True)
@@ -1762,24 +1817,44 @@ class LeRobotDataset(BaseDataset):
             # the shared reference (later padded in place by the mixture) is
             # benign.
             self.meta.stats = self.stats
+            # Reapply the optional robust-quantile sidecar after replacing the
+            # full-dataset aggregate with selected-episode statistics.
+            self.stats = merge_missing_stats_quantiles(self.stats, load_stats_quantiles(self.root))
+            self.meta.stats = self.stats
+
 
         if self.episodes is None:
             self.episodes = list(self.meta.episodes)
 
         # Load actual data
-        try:
-            if force_cache_sync:
-                raise FileNotFoundError
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
-            self.hf_dataset = self.load_hf_dataset()
-        except (AssertionError, FileNotFoundError, NotADirectoryError):
-            if is_valid_version(self.revision):
-                self.revision = get_safe_version(
-                    self.repo_id, self.revision, allow_branch_fallback=not revision
+        if local_files_only:
+            missing_files = [
+                self.root / path
+                for path in self.get_episodes_file_paths()
+                if not (self.root / path).is_file()
+            ]
+            if missing_files:
+                raise FileNotFoundError(
+                    f"Local-only dataset {self.repo_id!r} is missing selected episode files: "
+                    + ", ".join(str(path) for path in missing_files)
                 )
-            self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
+        else:
+            try:
+                if force_cache_sync:
+                    raise FileNotFoundError
+                assert all((self.root / path).is_file() for path in self.get_episodes_file_paths())
+                self.hf_dataset = self.load_hf_dataset()
+            except (AssertionError, FileNotFoundError, NotADirectoryError):
+                if is_valid_version(self.revision):
+                    self.revision = get_safe_version(
+                        self.repo_id, self.revision, allow_branch_fallback=not revision
+                    )
+                self.download_episodes(download_videos)
+                self.hf_dataset = self.load_hf_dataset()
 
+        no_transform_ds = self.hf_dataset.with_transform(None).with_format("arrow")
+        self._validate_advantage_coverage(no_transform_ds)
         self.episode_data_index, self.epi2idx = get_episode_data_index(self.meta.episodes, self.episodes)
 
         # Check timestamps
@@ -1806,7 +1881,6 @@ class LeRobotDataset(BaseDataset):
         else:
             # "arrow" (columnar), not "numpy": with_format("numpy")[col] row-formats
             # the whole table (O(rows) Python) -- very slow on large v3.0 datasets.
-            no_transform_ds = self.hf_dataset.with_transform(None).with_format("arrow")
             logging.info("Checking timestamps synchronization...")
             timestamps = np.asarray(no_transform_ds["timestamp"], dtype=np.float32)
             episode_indices = np.asarray(no_transform_ds["episode_index"], dtype=np.int64)
@@ -1840,6 +1914,11 @@ class LeRobotDataset(BaseDataset):
             epi2idx=self.epi2idx,
             valid_task_indices=set(self.meta.task_to_task_index.values()),
         )
+        self.task_reward_normalizers: dict[int, int] = {}
+        self._missing_reward_normalizer_tasks: set[int] = set()
+        if isinstance(self.cfg.policy, ValueConfig):
+            self.task_reward_normalizers = self._build_task_reward_normalizers()
+
         self.speed_percentiles_by_task: dict[int, list[float] | None] = load_or_compute_speed_percentiles(
             root=self.root,
             episode_lengths=self.episode_lengths,
@@ -1888,6 +1967,66 @@ class LeRobotDataset(BaseDataset):
             for ep in self.episodes:
                 starts = self.segment_starts_by_episode[ep]
                 self.segment_memories_by_episode[ep] = [""] * len(starts)
+
+    def _requires_dataset_advantages(self) -> bool:
+        return getattr(self.cfg.policy, "advantage", None) == "use"
+
+    def _validate_advantage_coverage(self, no_transform_ds: datasets.Dataset) -> None:
+        """Validate selected-frame coverage without triggering row transforms."""
+        if not self._requires_dataset_advantages():
+            return
+        validate_advantage_bundle_files(self.root, self.meta.advantages)
+        episode_indices = np.asarray(no_transform_ds["episode_index"], dtype=np.int64).reshape(-1)
+        frame_indices = np.asarray(no_transform_ds["frame_index"], dtype=np.int64).reshape(-1)
+        expected = {
+            (int(episode_index), int(frame_index))
+            for episode_index, frame_index in zip(episode_indices, frame_indices, strict=True)
+        }
+        actual = set(self.meta.advantages or {})
+        missing = expected - actual
+        if missing:
+            raise ValueError(
+                f"Advantage coverage is incomplete: {len(missing)} missing selected frame keys; "
+                f"examples={sorted(missing)[:10]}. Regenerate all advantage files."
+            )
+        selected_episodes = {episode_index for episode_index, _ in expected}
+        unexpected_selected = {key for key in actual - expected if key[0] in selected_episodes}
+        if unexpected_selected:
+            raise ValueError(
+                "Advantage coverage contains "
+                f"{len(unexpected_selected)} unexpected selected frame keys; "
+                f"examples={sorted(unexpected_selected)[:10]}. Regenerate all advantage files."
+            )
+        ignored = {key for key in actual - expected if key[0] not in selected_episodes}
+        if ignored:
+            logging.info("%d advantage keys outside selected episodes were ignored", len(ignored))
+
+    def _build_task_reward_normalizers(self) -> dict[int, int]:
+        """Return the maximum selected episode length for every task."""
+        result: dict[int, int] = {}
+        for episode_index in self.episodes:
+            task_index = self.episode_to_task_index.get(episode_index)
+            episode_length = self.episode_lengths.get(episode_index)
+            if task_index is None or episode_length is None or episode_length <= 0:
+                continue
+            result[task_index] = max(result.get(task_index, 0), episode_length)
+        return result
+
+    def _get_reward_normalizer_for_task(self, task_index: int) -> int:
+        """Resolve a task-specific normalizer with a logged config fallback."""
+        fallback = self.cfg.policy.reward_config.reward_normalizer
+        normalizer = self.task_reward_normalizers.get(task_index)
+        if normalizer is None or normalizer <= 0:
+            if task_index not in self._missing_reward_normalizer_tasks:
+                self._missing_reward_normalizer_tasks.add(task_index)
+                logging.warning(
+                    "Dataset %r has no positive episode length for task_index=%d; using reward_normalizer=%s",
+                    self.repo_id,
+                    task_index,
+                    fallback,
+                )
+            return fallback
+        return normalizer
 
     @on_accelerate_main_proc(local=True, _sync=True)
     def push_to_hub(
@@ -2666,6 +2805,22 @@ class LeRobotDataset(BaseDataset):
             item["mistake_raw"] = int(not success)
         return success
 
+    def _attach_intervention_raw(self, item: dict) -> None:
+        """Attach an explicitly mapped per-frame intervention label.
+
+        Unlike ``mistake``, this role has no literal-column fallback and is
+        never inferred from episode success. That keeps ordinary failures from
+        being treated as human interventions.
+        """
+        intervention_col = self._get_name_map(strict=False).get("intervention")
+        if intervention_col is not None and intervention_col in item:
+            value = item[intervention_col]
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    raise ValueError("Mapped intervention values must be scalar per frame.")
+                value = value.item()
+            item["intervention_raw"] = value
+
     @retry_random_on_failure
     def __getitem__(self, idx) -> dict:
         item = self.hf_dataset[idx]
@@ -2703,7 +2858,8 @@ class LeRobotDataset(BaseDataset):
 
         # Add task as a string, applying optional config-time prompt
         # substitution (see `_resolve_task`).
-        item["task"] = self._resolve_task(item["task_index"].item())
+        task_index = int(item["task_index"].item())
+        item["task"] = self._resolve_task(task_index)
 
         # Squeeze the temporal dimension for features with a single delta timestamp
         for feature, mean in self.delta_timestamps_params[0].items():
@@ -2735,6 +2891,7 @@ class LeRobotDataset(BaseDataset):
             if "memory" in item:
                 item["memory_raw"] = str(item["memory"])
             success = self._attach_mistake_raw(item, episodes_info, ep_idx)
+            self._attach_intervention_raw(item)
             item["next_memory_raw"] = self._lookup_next_memory(ep_idx, frame_in_ep)
             quality = self.meta.episodes[ep_idx].get("quality")
             if quality is not None:
@@ -2745,7 +2902,7 @@ class LeRobotDataset(BaseDataset):
             item = self._to_standard_data_format(item)
 
             if self.meta.advantages is not None:
-                advantage = self.meta.advantages.get((episode_index, timestamp.item()), 0)
+                advantage = self.meta.advantages.get((int(episode_index), int(frame_in_ep)), 0)
                 item["advantage"] = torch.tensor(advantage, dtype=torch.bfloat16)
             else:
                 item["advantage"] = torch.tensor(0.0, dtype=torch.bfloat16)
@@ -2756,11 +2913,12 @@ class LeRobotDataset(BaseDataset):
 
             # only add the below fields to item when training or evaluating the value fns
             if isinstance(self.cfg.policy, ValueConfig):
+                reward_normalizer = self._get_reward_normalizer_for_task(task_index)
                 item["return_bin_idx"], item["return_continuous"] = calculate_return_bins_with_equal_width(
                     success,
                     self.cfg.policy.reward_config.number_of_bins,
                     ep_end,
-                    self.cfg.policy.reward_config.reward_normalizer,
+                    reward_normalizer,
                     idx,
                     self.cfg.policy.reward_config.C_neg,
                 )
@@ -2774,7 +2932,9 @@ class LeRobotDataset(BaseDataset):
                     item["current_idx"] = idx
                     item["last_step"] = idx + self.cfg.policy.reward_config.N_steps_look_ahead >= ep_end
                     item["episode_index"] = episode_index
+                    item["frame_index"] = frame_in_ep
                     item["timestamp"] = timestamp
+                    item["reward_normalizer"] = torch.tensor(reward_normalizer, dtype=torch.long)
             else:
                 item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
                 item["return_continuous"] = torch.tensor(0, dtype=torch.float32)

@@ -526,7 +526,7 @@ class DatasetMixtureMetadata:
         # `mistake`/`success` are optional-metadata roles, not normalization
         # features — their columns may have stats on disk, but they must not
         # enter the standardized stats schema.
-        features_without_stats = ["prompt", "response", "advantage", "mistake", "success"]
+        features_without_stats = ["prompt", "response", "advantage", "mistake", "success", "intervention"]
 
         standard_stats = {}
         for new_key, key in name_map.items():

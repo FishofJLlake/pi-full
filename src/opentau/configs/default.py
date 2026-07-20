@@ -83,9 +83,12 @@ class DatasetConfig:
         video_backend: Video codec backend to use. Defaults to a safe default codec.
         stats: Dictionary of statistics for normalization, keyed by feature name.
             Each value is a dictionary with 'mean' and 'std' arrays. Defaults to None.
+        steam_source: Optional STEAM threshold-pool role. Must be `"expert"`
+            or `"non_expert"` for STEAM advantage generation and is ignored
+            by other policies.
         data_features_name_mapping: Optional mapping from standard feature
             names (``camera0``/``camera1``/..., ``state``, ``actions``,
-            ``prompt``, ``response``, ``mistake``, ``success``) to this
+            ``prompt``, ``response``, ``mistake``, ``success``, ``intervention``) to this
             dataset's own column names. The ``mistake`` and ``success`` roles
             feed the optional ``mistake`` metadata key: map a
             mistake-polarity column (True/1 = something went wrong) to
@@ -96,7 +99,10 @@ class DatasetConfig:
             must name a per-frame column; for an episode-level outcome map
             ``success`` instead, which resolves from a per-frame column or a
             per-episode key in the episodes metadata and also drives the
-            value-function return bins.
+            value-function return bins. The ``intervention`` role must be an
+            explicitly mapped per-frame human-intervention signal; it is never
+            inferred from ``mistake`` or ``success`` and is used only while
+            generating advantage labels.
             Two mixture entries may share a ``repo_id`` and ``control_mode``
             while declaring different mappings (e.g. two camera views of one
             repo): each dataset instance resolves its own entry's mapping.
@@ -165,6 +171,9 @@ class DatasetConfig:
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     stats: dict[str, dict[str, np.ndarray]] | None = None
+    # STEAM uses separate score distributions when converting continuous
+    # progress estimates into binary advantages.
+    steam_source: Literal["expert", "non_expert"] | None = None
 
     # optional standard data format mapping for the dataset if mapping is not already in standard_data_format_mapping.py
     data_features_name_mapping: dict[str, str] | None = None
