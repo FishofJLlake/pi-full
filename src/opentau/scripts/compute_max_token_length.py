@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 import math
 from collections import Counter
@@ -26,6 +27,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.dataset_mixture import WeightedDatasetMixture
 from opentau.datasets.factory import make_dataset_mixture
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.policies.factory import get_policy_class
@@ -67,6 +69,16 @@ def worker_fn(chunk, tokenizer: PreTrainedTokenizer):
     return Counter(len(tokenizer(s)["input_ids"]) for s in chunk)
 
 
+def make_unsplit_dataset_mixture(cfg: TrainPipelineConfig) -> WeightedDatasetMixture:
+    """Build the complete mixture without applying the training validation split."""
+    stats_cfg = copy.deepcopy(cfg)
+    stats_cfg.val_freq = 0
+    mixture = make_dataset_mixture(stats_cfg)
+    if isinstance(mixture, tuple):
+        raise RuntimeError("Dataset factory returned a validation split with val_freq=0")
+    return mixture
+
+
 def to_percentile(counter: Counter) -> dict[int, float]:
     r"""Convert counter to a dictionary with token lengths as keys and their percentile as values."""
     total = counter.total()
@@ -78,7 +90,7 @@ def to_percentile(counter: Counter) -> dict[int, float]:
 @parser.wrap()
 def main(args: Args):
     cfg = TrainPipelineConfig.from_pretrained(args.target_cfg)
-    datasets = make_dataset_mixture(cfg).datasets
+    datasets = make_unsplit_dataset_mixture(cfg).datasets
     tokenizer = get_tokenizer(cfg)
     worker = partial(worker_fn, tokenizer=tokenizer)
 
