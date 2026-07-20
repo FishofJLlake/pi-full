@@ -45,4 +45,5 @@ from .pi07_paligemma.high_level_planner import (
 from .pi07_paligemma.low_level import (
     configuration_pi07_low_level as _pi07_paligemma_low_level_config,  # noqa: F401
 )
+from .steam.configuration_steam import SteamConfig as SteamConfig
 from .value.configuration_value import ValueConfig as ValueConfig

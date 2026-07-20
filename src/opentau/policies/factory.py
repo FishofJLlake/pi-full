@@ -52,6 +52,7 @@ from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level impo
     PI07PaligemmaLowLevelConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.policies.steam.configuration_steam import SteamConfig
 from opentau.policies.value.configuration_value import ValueConfig
 
 
@@ -129,6 +130,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from opentau.policies.value.modeling_value import ValueFunction
 
         return ValueFunction
+    elif name == "steam":
+        from opentau.policies.steam.modeling_steam import SteamPolicy
+
+        return SteamPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -176,6 +181,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return Cosmos3NanoConfig(**kwargs)
     elif policy_type == "value":
         return ValueConfig(**kwargs)
+    elif policy_type == "steam":
+        return SteamConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 

@@ -103,6 +103,7 @@ opentau-train = "opentau.scripts.launch:train"
 opentau-eval = "opentau.scripts.launch:eval"
 opentau-export = "opentau.scripts.launch:export"
 opentau-dataset-viz = "opentau.scripts.launch:visualize"
+opentau-steam-advantages = "opentau.scripts.compute_steam_advantages:cli"
 
 [project.optional-dependencies]
 dev = ["pre-commit>=3.7.0",

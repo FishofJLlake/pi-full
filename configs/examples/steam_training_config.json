@@ -1,0 +1,61 @@
+{
+    "dataset_mixture": {
+        "datasets": [
+            {
+                "repo_id": "REPLACE_WITH_EXPERT_REPO_ID",
+                "root": "REPLACE_WITH_EXPERT_DATASET_ROOT",
+                "steam_source": "expert"
+            }
+        ],
+        "weights": [1.0],
+        "action_freq": 30.0,
+        "image_resample_strategy": "nearest",
+        "vector_resample_strategy": "nearest"
+    },
+    "policy": {
+        "type": "steam",
+        "vision_pretrained_path": "google/siglip-so400m-patch14-384",
+        "language_pretrained_path": "google/gemma-3-270m",
+        "tokenizer_path": "google/gemma-3-270m",
+        "prompt_max_length": 128,
+        "chunk_size": 32,
+        "num_bins": 32,
+        "max_temporal_offset": 32,
+        "length_reference_percentile": 90.0,
+        "fusion_hidden_dim": 512,
+        "dropout": 0.1,
+        "label_smoothing": 0.05,
+        "freeze_vision_encoder": false,
+        "freeze_language_model": false,
+        "use_gradient_checkpointing": true
+    },
+    "output_dir": "outputs/steam/member_0",
+    "seed": 0,
+    "resolution": [224, 224],
+    "num_cams": 2,
+    "max_state_dim": 32,
+    "max_action_dim": 32,
+    "action_chunk": 32,
+    "loss_weighting": {
+        "MSE": 0.0,
+        "CE": 1.0
+    },
+    "num_workers": 8,
+    "batch_size": 512,
+    "gradient_accumulation_steps": 8,
+    "dataloader_batch_size": 64,
+    "prefetch_factor": 4,
+    "steps": 30000,
+    "log_freq": 50,
+    "save_checkpoint": true,
+    "save_freq": 5000,
+    "val_freq": 0,
+    "ema_decay": null,
+    "use_policy_training_preset": true,
+    "trace_nans": false,
+    "wandb": {
+        "enable": false,
+        "project": "steam",
+        "notes": "Independent STEAM member"
+    }
+}

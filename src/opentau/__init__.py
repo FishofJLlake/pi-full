@@ -172,6 +172,7 @@ available_policies = [
     "cosmos3",
     "cosmos3_nano",
     "value",
+    "steam",
 ]
 
 # keys and values refer to yaml files

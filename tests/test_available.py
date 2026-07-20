@@ -29,6 +29,7 @@ from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
 from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
     PI07LowLevelPolicy,
 )
+from opentau.policies.steam.modeling_steam import SteamPolicy
 from opentau.policies.value.modeling_value import ValueFunction
 
 
@@ -47,6 +48,7 @@ def test_available_policies():
         PI07LowLevelPolicy,
         Cosmos3Policy,
         Cosmos3NanoPolicy,
+        SteamPolicy,
     ]
     policies = [pol_cls.name for pol_cls in policy_classes]
     assert set(policies) == set(opentau.available_policies), policies

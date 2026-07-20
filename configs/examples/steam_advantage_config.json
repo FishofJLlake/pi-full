@@ -1,0 +1,18 @@
+{
+    "datasets": [
+        {
+            "repo_id": "REPLACE_WITH_EXPERT_REPO_ID",
+            "root": "REPLACE_WITH_EXPERT_DATASET_ROOT",
+            "steam_source": "expert"
+        },
+        {
+            "repo_id": "REPLACE_WITH_NON_EXPERT_REPO_ID",
+            "root": "REPLACE_WITH_NON_EXPERT_DATASET_ROOT",
+            "steam_source": "non_expert"
+        }
+    ],
+    "weights": [1.0, 1.0],
+    "action_freq": 30.0,
+    "image_resample_strategy": "nearest",
+    "vector_resample_strategy": "nearest"
+}
