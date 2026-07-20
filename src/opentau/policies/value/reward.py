@@ -49,8 +49,9 @@ def calculate_return_bins_with_equal_width(
             return_value + c_neg
         )  # use assignment so result is float when c_neg is float (avoids int/Long+=Float in-place error)
 
-    # normalize the reward to the range of -1 to 0
-    return_normalized = return_value / reward_normalizer
+    # Include the failure penalty scale so failed returns stay within [-1, 0].
+    normalization_factor = reward_normalizer + abs(c_neg)
+    return_normalized = return_value / normalization_factor
     # mapping normalized reward [-1,0) to bin index [0,b-1]
     bin_idx = int((return_normalized + 1) * (b - 1))
     return bin_idx, return_normalized
@@ -85,7 +86,7 @@ def calculate_n_step_return(
             return_value + c_neg
         )  # use assignment so result is float when c_neg is float (avoids Long+=Float in-place error)
 
-    # normalize the reward to the range of -1 to 0
-    return_normalized = return_value / reward_normalizer
+    normalization_factor = reward_normalizer + abs(c_neg)
+    return_normalized = return_value / normalization_factor
 
     return return_normalized

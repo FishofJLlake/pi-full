@@ -134,6 +134,8 @@ class ValueFunction(PreTrainedPolicy):
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
         per_dataset_stats: list[dict[str, dict[str, Tensor]]] | None = None,
         dataset_names: list[str] | None = None,
+        *,
+        backbone_local_files_only: bool = False,
     ):
         """Initializes the ValueFunction policy.
 
@@ -215,8 +217,10 @@ class ValueFunction(PreTrainedPolicy):
             num_datasets=num_datasets,
         )
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m")
-        self.model = ValueModel(config)
+        self.language_tokenizer = AutoTokenizer.from_pretrained(
+            "google/gemma-3-270m", local_files_only=backbone_local_files_only
+        )
+        self.model = ValueModel(config, backbone_local_files_only=backbone_local_files_only)
 
     def reset(self):
         """Resets the internal state of the policy.
@@ -324,51 +328,45 @@ class ValueFunction(PreTrainedPolicy):
         Returns:
             Tensor: The expected value.
         """
-        start_idx = torch.linspace(
-            -1,
-            -1 / self.config.reward_config.number_of_bins,
-            self.config.reward_config.number_of_bins,
-            device=logits.device,
+        bins = self.value_bins(logits.device)
+        value = torch.softmax(logits, dim=-1).to(dtype=torch.float32) @ rearrange(
+            bins,
+            "bin -> bin 1",
         )
-        end_idx = torch.linspace(
-            -1 + 1 / self.config.reward_config.number_of_bins,
-            0,
-            self.config.reward_config.number_of_bins,
-            device=logits.device,
-        )
-
-        mid_idx = rearrange(
-            (start_idx + end_idx) / 2,
-            "n -> 1 n",
-        )
-
-        value = torch.softmax(logits, dim=-1).to(dtype=torch.float32) @ mid_idx.T
-
         return rearrange(value, "b 1 -> b")
+
+    def value_bins(self, device: torch.device | str) -> Tensor:
+        """Return float32 centers of the configured ordinal value bins."""
+        edges = torch.linspace(
+            -1.0,
+            0.0,
+            self.config.reward_config.number_of_bins + 1,
+            device=device,
+            dtype=torch.float32,
+        )
+        return (edges[:-1] + edges[1:]) / 2
+
+    @torch.no_grad()
+    def predict_value_distribution(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Return float32 value-bin logits, probabilities, and expected value."""
+        self.eval()
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
+        images, img_masks = self.prepare_images(batch)
+        lang_tokens, lang_masks = self.prepare_language(batch)
+        logits = self.model.get_value(images, img_masks, lang_tokens, lang_masks).to(torch.float32)
+        probabilities = torch.softmax(logits, dim=-1).to(torch.float32)
+        return {
+            "logits": logits,
+            "probabilities": probabilities,
+            "bins": self.value_bins(logits.device),
+            "value": self.calculate_value(logits),
+        }
 
     @torch.no_grad()
     def predict_value(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict value estimates given environment observations.
-
-        Args:
-            batch: Dictionary containing observations (images, state, prompt)
-
-        Returns:
-            Tensor of shape [batch_size, 1] containing value estimates
-        """
-        self.eval()
-
-        # `ValueFunction` is a single-dataset policy (its `Normalize` was
-        # built with `num_datasets=1`); `_resolve_dataset_index` defaults
-        # to zeros in that case so callers don't need to inject the index.
-        dataset_index = self._resolve_dataset_index(batch)
-        batch = self.normalize_inputs(batch, dataset_index)
-
-        images, img_masks = self.prepare_images(batch)
-        lang_tokens, lang_masks = self.prepare_language(batch)
-
-        logits = self.model.get_value(images, img_masks, lang_tokens, lang_masks)
-        return self.calculate_value(logits)
+        """Predict expected values while preserving the legacy scalar API."""
+        return self.predict_value_distribution(batch)["value"]
 
     def forward(
         self, batch: dict[str, Tensor], return_per_sample: bool = False
@@ -646,7 +644,7 @@ class ValueModel(nn.Module):
     └──────────────────────────────┘
     """
 
-    def __init__(self, config):
+    def __init__(self, config, *, backbone_local_files_only: bool = False):
         """Initializes the ValueModel.
 
         Args:
@@ -659,7 +657,10 @@ class ValueModel(nn.Module):
             num_value_bins=self.config.reward_config.number_of_bins,
             response_max_length=self.config.response_max_length,
         )
-        self.siglip_gemma_value = SiglipGemmaValueModel(siglip_gemma_value_config)
+        self.siglip_gemma_value = SiglipGemmaValueModel(
+            siglip_gemma_value_config,
+            local_files_only=backbone_local_files_only,
+        )
 
         # Projection for state if provided
         self.state_proj = nn.Linear(self.config.max_state_dim, 640)
@@ -747,6 +748,18 @@ class ValueModel(nn.Module):
 
         return embs, pad_masks, att_masks
 
+    @staticmethod
+    def _get_classification_indices(lang_masks: Tensor, num_image_tokens: int) -> Tensor:
+        prompt_positions = torch.arange(lang_masks.shape[1], device=lang_masks.device)
+        last_valid_prompt = torch.where(
+            lang_masks.to(dtype=torch.bool),
+            prompt_positions,
+            torch.full_like(prompt_positions, -1),
+        ).amax(dim=-1)
+        if torch.any(last_valid_prompt < 0):
+            raise ValueError("Every prompt must contain at least one valid token")
+        return last_valid_prompt + num_image_tokens
+
     def forward(
         self,
         images: list[torch.Tensor],
@@ -771,6 +784,9 @@ class ValueModel(nn.Module):
         embs, pad_masks, att_masks = self.embed_sequence(
             images, img_masks, lang_tokens, lang_masks, response_tokens, response_masks
         )
+        response_length = 0 if response_tokens is None else response_tokens.shape[1]
+        num_image_tokens = embs.shape[1] - lang_tokens.shape[1] - response_length
+        classification_indices = self._get_classification_indices(lang_masks, num_image_tokens)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
@@ -779,6 +795,7 @@ class ValueModel(nn.Module):
             inputs_embeds=embs,
             attention_mask=att_2d_masks,
             position_ids=position_ids,
+            classification_indices=classification_indices,
         )
 
         return value_logits, response_logits
@@ -803,6 +820,8 @@ class ValueModel(nn.Module):
             Tensor of shape [batch_size, 1] containing value estimates
         """
         embs, pad_masks, att_masks = self.embed_sequence(images, img_masks, lang_tokens, lang_masks)
+        num_image_tokens = embs.shape[1] - lang_tokens.shape[1]
+        classification_indices = self._get_classification_indices(lang_masks, num_image_tokens)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
@@ -811,6 +830,7 @@ class ValueModel(nn.Module):
             inputs_embeds=embs,
             attention_mask=att_2d_masks,
             position_ids=position_ids,
+            classification_indices=classification_indices,
         )
 
         return value_logits

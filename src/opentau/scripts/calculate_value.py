@@ -16,7 +16,7 @@
 """Compute value function outputs for a value policy over a configured dataset.
 
 Loads a value policy from a checkpoint and runs predict_value on each batch from
-the dataset mixture in the config. Saves (episode_index, timestamp) -> value to JSON.
+the dataset mixture in the config. Saves (episode_index, frame_index) -> value to JSON.
 
 Usage:
   # From checkpoint dir (has train_config.json and policy weights)
@@ -46,6 +46,7 @@ Usage:
 import argparse
 import json
 import logging
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -59,6 +60,8 @@ from opentau.configs.refs import resolve_refs_to_tempfile
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset
 from opentau.policies.factory import get_policy_class
+from opentau.policies.value.configuration_value import ValueConfig
+from opentau.scripts.value_artifacts import serialize_value_key
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import auto_torch_device, init_logging
 
@@ -104,7 +107,7 @@ def _parse_args():
         "--output_file",
         type=Path,
         default=Path("values.json"),
-        help="Output JSON file for (episode_index,timestamp) -> value.",
+        help="Output JSON file for (episode_index,frame_index) -> value.",
     )
     parser.add_argument(
         "--checkpoint_path",
@@ -124,6 +127,10 @@ def _parse_args():
 def main(cfg: TrainPipelineConfig, args: argparse.Namespace):
     output_file = args.output_file
     dataset_mixture_path = args.dataset_mixture
+    if not isinstance(cfg.policy, ValueConfig):
+        raise ValueError(
+            f"calculate_value requires policy.type='value'; got {cfg.policy.type!r}"
+        )
     if args.train_config:
         logging.info("Using full train config: %s", args.train_config)
 
@@ -147,13 +154,20 @@ def main(cfg: TrainPipelineConfig, args: argparse.Namespace):
 
     device = auto_torch_device()
     checkpoint_path = args.checkpoint_path or cfg.policy.pretrained_path
+    if checkpoint_path is None:
+        raise ValueError("A Value checkpoint must be provided")
     logging.info("Loading value policy from checkpoint: %s", checkpoint_path)
     policy_class = get_policy_class(cfg.policy.type)
-    policy = policy_class.from_pretrained(checkpoint_path, config=cfg.policy)
+    policy = policy_class.from_pretrained(
+        checkpoint_path,
+        config=cfg.policy,
+        local_files_only=True,
+        backbone_local_files_only=True,
+    )
     policy.to(device=device, dtype=torch.bfloat16)
     policy.eval()
 
-    # (episode_index, timestamp) -> value (float)
+    # (episode_index, frame_index) -> value (float)
     all_values = {}
 
     for dataset_idx, dataset_cfg in enumerate(mixture_cfg.datasets):
@@ -162,15 +176,16 @@ def main(cfg: TrainPipelineConfig, args: argparse.Namespace):
         dataset = result[0] if isinstance(result, tuple) else result
 
         batch_size = args.batch_size if args.batch_size is not None else cfg.batch_size
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=cfg.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            prefetch_factor=cfg.prefetch_factor,
-        )
+        dataloader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": False,
+            "drop_last": False,
+            "num_workers": cfg.num_workers,
+            "pin_memory": torch.cuda.is_available(),
+        }
+        if cfg.num_workers > 0 and cfg.prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+        dataloader = DataLoader(dataset, **dataloader_kwargs)
 
         with torch.inference_mode():
             for batch in dataloader:
@@ -179,23 +194,31 @@ def main(cfg: TrainPipelineConfig, args: argparse.Namespace):
                         batch[key] = value.to(device)
 
                 values_tensor = policy.predict_value(batch)
-                for ep_idx, ts, val in zip(
+                for ep_idx, frame_idx, val in zip(
                     batch["episode_index"],
-                    batch["timestamp"],
+                    batch["frame_index"],
                     values_tensor,
                     strict=True,
                 ):
                     ep_idx = _to_scalar(ep_idx)
-                    ts = _to_scalar(ts)
+                    frame_idx = _to_scalar(frame_idx)
                     val = _to_scalar(val)
                     if isinstance(ep_idx, np.ndarray):
                         ep_idx = int(ep_idx.flat[0])
-                    if isinstance(ts, np.ndarray):
-                        ts = int(ts.flat[0])
+                    if isinstance(frame_idx, np.ndarray):
+                        frame_idx = int(frame_idx.flat[0])
                     if isinstance(val, np.ndarray):
                         val = float(val.flat[0])
-                    key = f"{ep_idx},{ts}"
-                    all_values[key] = float(val)
+                    key = serialize_value_key(int(ep_idx), int(frame_idx))
+                    value = float(val)
+                    if not math.isfinite(value):
+                        raise ValueError(f"Value for frame key {key!r} is not finite: {value!r}")
+                    if key in all_values:
+                        raise ValueError(
+                            f"Duplicate frame key {key!r} across the configured value dataset(s). "
+                            "Generate separate artifacts or remap episode indices."
+                        )
+                    all_values[key] = value
 
     values_list = list(all_values.values())
     n = len(values_list)
@@ -214,59 +237,57 @@ def main(cfg: TrainPipelineConfig, args: argparse.Namespace):
     arr = np.array(values_list)
     logging.info(f"Value stats: min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}, count={n}")
 
-    # Plot value over timestamp
+    # Plot value over frame index
     try:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        logging.warning("matplotlib not installed; skipping value-over-timestamp plot.")
+        logging.warning("matplotlib not installed; skipping value-over-frame-index plot.")
     else:
-        # Parse keys "ep_idx,ts" -> (episode_index, timestamp)
-        # Timestamp may be int or float string (e.g. "0.0") depending on dataset format.
-        timestamps = []
+        frame_indices = []
         values_plot = []
         for key, val in all_values.items():
-            ep_idx_str, ts_str = key.split(",", 1)
-            timestamps.append(int(float(ts_str)))
+            _, frame_idx_str = key.split(",", 1)
+            frame_indices.append(int(frame_idx_str))
             values_plot.append(val)
 
-        timestamps = np.array(timestamps)
+        frame_indices = np.array(frame_indices)
         values_plot = np.array(values_plot)
         out_dir = out_path.parent
-        plot_path = out_dir / "value_over_timestamp.png"
+        plot_path = out_dir / "value_over_frame_index.png"
 
         fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=False)
 
-        # 1) Scatter: all (timestamp, value) points
-        axes[0].scatter(timestamps, values_plot, alpha=0.25, s=4, c="steelblue")
-        axes[0].set_xlabel("Timestamp")
+        # 1) Scatter: all (frame index, value) points
+        axes[0].scatter(frame_indices, values_plot, alpha=0.25, s=4, c="steelblue")
+        axes[0].set_xlabel("Frame index")
         axes[0].set_ylabel("Value")
-        axes[0].set_title("Value vs timestamp (all points)")
+        axes[0].set_title("Value vs frame index (all points)")
         axes[0].grid(True, alpha=0.3)
 
-        # 2) Lines: value over timestamp for first N episodes
+        # 2) Lines: value over frame index for first N episodes
         by_episode = defaultdict(list)
         for key, val in all_values.items():
-            ep_idx_str, ts_str = key.split(",", 1)
-            by_episode[int(ep_idx_str)].append((int(float(ts_str)), val))
+            ep_idx_str, frame_idx_str = key.split(",", 1)
+            by_episode[int(ep_idx_str)].append((int(frame_idx_str), val))
         max_episodes_plot = 10
         for ep_idx, points in sorted(by_episode.items())[:max_episodes_plot]:
             points.sort(key=lambda p: p[0])
-            ts_ep = np.array([p[0] for p in points])
+            frame_idx_ep = np.array([p[0] for p in points])
             val_ep = np.array([p[1] for p in points])
-            axes[1].plot(ts_ep, val_ep, alpha=0.8, label=f"Episode {ep_idx}")
-        axes[1].set_xlabel("Timestamp")
+            axes[1].plot(frame_idx_ep, val_ep, alpha=0.8, label=f"Episode {ep_idx}")
+        axes[1].set_xlabel("Frame index")
         axes[1].set_ylabel("Value")
-        axes[1].set_title(f"Value vs timestamp (first {min(max_episodes_plot, len(by_episode))} episodes)")
+        axes[1].set_title(f"Value vs frame index (first {min(max_episodes_plot, len(by_episode))} episodes)")
         axes[1].legend(loc="best", fontsize=8)
         axes[1].grid(True, alpha=0.3)
 
         fig.tight_layout()
         fig.savefig(plot_path, dpi=150)
         plt.close(fig)
-        logging.info(f"Saved value-over-timestamp plot to {plot_path}")
+        logging.info(f"Saved value-over-frame-index plot to {plot_path}")
     # end plot
 
 

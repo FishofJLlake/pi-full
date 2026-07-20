@@ -138,7 +138,7 @@ class SiglipGemmaValueModel(PreTrainedModel):
 
     config_class = SiglipGemmaValueConfig
 
-    def __init__(self, config: SiglipGemmaValueConfig):
+    def __init__(self, config: SiglipGemmaValueConfig, *, local_files_only: bool = False):
         """Initializes the SiglipGemmaValueModel.
 
         Args:
@@ -146,10 +146,14 @@ class SiglipGemmaValueModel(PreTrainedModel):
         """
         super().__init__(config=config)
 
-        self.vision_encoder = SiglipVisionModel.from_pretrained("google/siglip2-so400m-patch14-224")
+        self.vision_encoder = SiglipVisionModel.from_pretrained(
+            "google/siglip2-so400m-patch14-224", local_files_only=local_files_only
+        )
 
         # Initialize language model (Gemma 3 270M)
-        self.gemma = Gemma3ForCausalLM.from_pretrained("google/gemma-3-270m")
+        self.gemma = Gemma3ForCausalLM.from_pretrained(
+            "google/gemma-3-270m", local_files_only=local_files_only
+        )
         self.gemma = self.gemma.model  # we do not want the LM head
 
         # Value head: projects final hidden state to discretized value bins
@@ -184,11 +188,19 @@ class SiglipGemmaValueModel(PreTrainedModel):
         """
         return self.gemma.embed_tokens(tokens)
 
+    @staticmethod
+    def _select_value_hidden(
+        hidden_states: torch.Tensor, classification_indices: torch.LongTensor
+    ) -> torch.Tensor:
+        batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+        return hidden_states[batch_indices, classification_indices, :]
+
     def forward(
         self,
         inputs_embeds: torch.FloatTensor,
         attention_mask: torch.Tensor,
         position_ids: torch.LongTensor,
+        classification_indices: torch.LongTensor,
     ) -> torch.Tensor:
         """Forward pass that processes vision and language inputs and outputs a value.
 
@@ -215,11 +227,7 @@ class SiglipGemmaValueModel(PreTrainedModel):
         )
         hidden_states = outputs.last_hidden_state
 
-        # Extract the last token's hidden state for value prediction
-        # Use the last token (which should be the last language token)
-
-        # extract token just before response <bos> token
-        classification_hidden = hidden_states[:, -self.config.response_max_length - 1, :]
+        classification_hidden = self._select_value_hidden(hidden_states, classification_indices)
         # extract tokens from response <bos> token to just before last token
         response_hidden = hidden_states[:, -self.config.response_max_length : -1, :]
 
@@ -235,6 +243,7 @@ class SiglipGemmaValueModel(PreTrainedModel):
         inputs_embeds: torch.FloatTensor,
         attention_mask: torch.Tensor,
         position_ids: torch.LongTensor,
+        classification_indices: torch.LongTensor,
     ) -> torch.Tensor:
         """Forward pass that processes vision and language inputs and outputs a value.
 
@@ -261,11 +270,7 @@ class SiglipGemmaValueModel(PreTrainedModel):
         )
         hidden_states = outputs.last_hidden_state
 
-        # Extract the last token's hidden state for value prediction
-        # Use the last token (which should be the last language token)
-
-        # extract last token while inference
-        value_hidden = hidden_states[:, -1, :]
+        value_hidden = self._select_value_hidden(hidden_states, classification_indices)
 
         # Project to logits for discretized values
         value_logits = self.value_head(value_hidden)
