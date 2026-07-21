@@ -123,7 +123,7 @@ class PI05Config(PreTrainedConfig):
     # (``AutoProcessor.from_pretrained(..., trust_remote_code=True)``).
     # Override to use a tokenizer specialized to your mixture (see
     # ``opentau.scripts.fit_fast_tokenizer``).
-    discrete_action_tokenizer_path: str = "physical-intelligence/fast"
+    discrete_action_tokenizer_path: str = "/data/modelRepository/opentau/opentau_2026126103220/fast"
 
     # Projector
     proj_width: int = 1024

@@ -324,7 +324,7 @@ class PI05Policy(PreTrainedPolicy):
         # `PI05FlowMatching`. The single `ensure_loc_tokens` call inside the
         # inner ctor promotes the reserved <loc0000>..<loc1023> entries on
         # both layers at once — no second load, no risk of revision drift.
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        self.language_tokenizer = AutoTokenizer.from_pretrained("/data/modelRepository/opentau/opentau_2026126103220/paligemma-3b-pt-224")
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True

@@ -218,7 +218,7 @@ class ValueFunction(PreTrainedPolicy):
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained(
-            "google/gemma-3-270m", local_files_only=backbone_local_files_only
+            "/data/modelRepository/opentau/opentau_2026126103220/gemma-3-270m", local_files_only=backbone_local_files_only
         )
         self.model = ValueModel(config, backbone_local_files_only=backbone_local_files_only)
 

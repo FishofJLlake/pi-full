@@ -147,12 +147,12 @@ class SiglipGemmaValueModel(PreTrainedModel):
         super().__init__(config=config)
 
         self.vision_encoder = SiglipVisionModel.from_pretrained(
-            "google/siglip2-so400m-patch14-224", local_files_only=local_files_only
+            "/data/modelRepository/opentau/opentau_2026126103220/siglip2-so400m-patch14-224", local_files_only=local_files_only
         )
 
         # Initialize language model (Gemma 3 270M)
         self.gemma = Gemma3ForCausalLM.from_pretrained(
-            "google/gemma-3-270m", local_files_only=local_files_only
+            "/data/modelRepository/opentau/opentau_2026126103220/gemma-3-270m", local_files_only=local_files_only
         )
         self.gemma = self.gemma.model  # we do not want the LM head
 
