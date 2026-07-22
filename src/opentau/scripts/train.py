@@ -217,6 +217,33 @@ def _assemble_weighted_loss(losses: dict, loss_weighting: dict[str, float]) -> t
     return total
 
 
+def _run_post_optimizer_step(
+    optimizer: AcceleratedOptimizer,
+    accelerator: accelerate.Accelerator,
+    *,
+    lr_scheduler: AcceleratedScheduler | None = None,
+    ema: NamedParameterEMA | None = None,
+) -> None:
+    """Advance update-level state only after a successful parameter update.
+
+    ``AcceleratedOptimizer.step`` is a no-op on non-sync micro-batches, but this
+    training loop deliberately constructs ``Accelerator`` with
+    ``step_scheduler_with_optimizer=False``. Consequently, the scheduler wrapper
+    does not inherit the optimizer's gradient-accumulation or skipped-step
+    gating, so those conditions must be applied explicitly here.
+    """
+    optimizer_step_succeeded = accelerator.sync_gradients and not getattr(
+        optimizer, "step_was_skipped", False
+    )
+    if not optimizer_step_succeeded:
+        return
+
+    if ema is not None:
+        ema.update()
+    if lr_scheduler is not None:
+        lr_scheduler.step()
+
+
 def update_policy(
     train_config: TrainPipelineConfig,
     train_metrics: MetricsTracker,
@@ -254,14 +281,13 @@ def update_policy(
             train_metrics.grad_norm = grad_norm
 
     optimizer.step()
-    if ema is not None and accelerator.sync_gradients and not getattr(optimizer, "step_was_skipped", False):
-        ema.update()
-
+    _run_post_optimizer_step(
+        optimizer,
+        accelerator,
+        lr_scheduler=lr_scheduler,
+        ema=ema,
+    )
     optimizer.zero_grad()
-
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
 
     # This calls `torch.distributed.all_gather_into_tensor` under the hood, which is not so efficient.
     # We don't actually want to broadcast the gathered tensors to all processes, but only to the main process.
@@ -710,9 +736,7 @@ def _sync_deepspeed_gradient_accumulation_steps(
     accelerator.deepspeed_plugin.gradient_accumulation_steps = target
 
 
-def _validate_ema_backend(
-    ema_decay: float | None, distributed_type: accelerate.DistributedType
-) -> None:
+def _validate_ema_backend(ema_decay: float | None, distributed_type: accelerate.DistributedType) -> None:
     """Reject EMA before model construction on parameter-sharded backends."""
     if ema_decay is None:
         return

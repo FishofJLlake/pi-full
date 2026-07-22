@@ -40,6 +40,7 @@ from opentau.scripts.train import (
     _find_unused_params_from_env,
     _init_wandb_trackers,
     _mixture_weighted_aggregate,
+    _run_post_optimizer_step,
     _sync_deepspeed_gradient_accumulation_steps,
 )
 from opentau.utils.logging_utils import AverageMeter, MetricsTracker
@@ -85,6 +86,42 @@ class TestFindUnusedParamsFromEnv:
         for value in ("yes", "1", "enabled", "Y", "on"):
             monkeypatch.setenv("FIND_UNUSED_PARAMS", value)
             assert _find_unused_params_from_env() is False, f"Expected {value!r} to parse as False, got True"
+
+
+def test_post_optimizer_state_advances_once_per_accumulation_window():
+    optimizer = SimpleNamespace(step_was_skipped=False)
+    accelerator = SimpleNamespace(sync_gradients=False)
+    lr_scheduler = Mock()
+    ema = Mock()
+
+    for sync_gradients in (False, False, False, True):
+        accelerator.sync_gradients = sync_gradients
+        _run_post_optimizer_step(
+            optimizer,
+            accelerator,
+            lr_scheduler=lr_scheduler,
+            ema=ema,
+        )
+
+    lr_scheduler.step.assert_called_once_with()
+    ema.update.assert_called_once_with()
+
+
+def test_post_optimizer_state_does_not_advance_when_step_is_skipped():
+    optimizer = SimpleNamespace(step_was_skipped=True)
+    accelerator = SimpleNamespace(sync_gradients=True)
+    lr_scheduler = Mock()
+    ema = Mock()
+
+    _run_post_optimizer_step(
+        optimizer,
+        accelerator,
+        lr_scheduler=lr_scheduler,
+        ema=ema,
+    )
+
+    lr_scheduler.step.assert_not_called()
+    ema.update.assert_not_called()
 
 
 def _make_accelerator(distributed_type, ds_grad_acc, is_main_process=True):
