@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from datasets import Dataset as HFDataset
 
 from opentau.datasets.steam_pair_dataset import (
     SteamPairDataset,
@@ -33,6 +34,10 @@ class _FakeHFDataset:
         }
 
     def with_transform(self, _transform):
+        return self
+
+    def with_format(self, format_type):
+        assert format_type == "arrow"
         return self
 
     def __getitem__(self, key):
@@ -100,6 +105,17 @@ def test_training_pairs_include_forward_and_reverse_without_crossing_episodes():
     )
     assert forward["steam_target_bin"].item() >= 4
     assert reverse["steam_target_bin"].item() < 4
+
+
+def test_metadata_columns_bypass_hugging_face_row_transforms():
+    base_dataset = _FakeLeRobotDataset([2, 1])
+    base_dataset.hf_dataset = HFDataset.from_dict(base_dataset.hf_dataset.columns)
+    base_dataset.hf_dataset.set_transform(lambda batch: batch)
+
+    dataset = SteamPairDataset(base_dataset, _config(), mode="inference")
+
+    assert dataset.frame_records == [(0, 0, 0), (0, 1, 1), (1, 0, 2)]
+    assert dataset.terminal_records == [(0, 1, 1), (1, 0, 2)]
 
 
 def test_inference_uses_paper_length_scaling_without_a_minimum_scale_clamp():

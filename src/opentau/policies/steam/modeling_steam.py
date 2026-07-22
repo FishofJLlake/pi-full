@@ -66,7 +66,7 @@ def _module_dtype(module: nn.Module, fallback: torch.dtype = torch.float32) -> t
 def _enable_gradient_checkpointing(module: nn.Module) -> None:
     enable = getattr(module, "gradient_checkpointing_enable", None)
     if callable(enable):
-        enable()
+        enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
 
 class SteamPolicy(PreTrainedPolicy):

@@ -61,11 +61,12 @@ class SteamPairDataset(Dataset):
         self.root = base_dataset.root
         self.repo_id = base_dataset.repo_id
 
-        raw_dataset = getattr(
-            base_dataset, "_metadata_hf_dataset", base_dataset.hf_dataset.with_transform(None)
-        )
-        episode_indices = raw_dataset["episode_index"]
-        frame_indices = raw_dataset["frame_index"]
+        raw_dataset = getattr(base_dataset, "_metadata_hf_dataset", None)
+        if raw_dataset is None:
+            # Override the row transform and read metadata through Arrow's columnar path.
+            raw_dataset = base_dataset.hf_dataset.with_format("arrow")
+        episode_indices = np.asarray(raw_dataset["episode_index"], dtype=np.int64).reshape(-1)
+        frame_indices = np.asarray(raw_dataset["frame_index"], dtype=np.int64).reshape(-1)
         if len(episode_indices) != len(base_dataset):
             raise ValueError(
                 "STEAM requires one metadata row per selected LeRobot frame; "

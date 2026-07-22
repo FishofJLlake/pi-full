@@ -56,6 +56,15 @@ def test_steam_config_rejects_an_invalid_bin_layout():
         SteamConfig(max_temporal_offset=3, num_bins=4)
 
 
+def test_gradient_checkpointing_uses_non_reentrant_path():
+    calls = []
+    module = SimpleNamespace(gradient_checkpointing_enable=lambda **kwargs: calls.append(kwargs))
+
+    modeling_steam._enable_gradient_checkpointing(module)  # noqa: SLF001
+
+    assert calls == [{"gradient_checkpointing_kwargs": {"use_reentrant": False}}]
+
+
 class _FakeVision(nn.Module):
     def __init__(self):
         super().__init__()
