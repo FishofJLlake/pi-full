@@ -720,11 +720,20 @@ class PI05Policy(PreTrainedPolicy):
             guidance_scale=self.config.guidance_scale if use_cfg else 1.0,
         )
 
-        # Unpad actions
-        original_action_dim = self.config.action_feature.shape[0]
-        actions = actions[:, :, :original_action_dim]
-
         actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
+
+        # Unpad only after unnormalization, whose statistics are stored at the
+        # padded action-feature width. An explicit deployment dimension takes
+        # precedence so checkpoints with a padded 32-D action feature can return
+        # the robot's real action width (for example, 20-D dual-arm rot6d).
+        if self.config.actual_action_dim is not None:
+            actions = actions[:, :, : self.config.actual_action_dim]
+        else:
+            if self.config.action_feature is None:
+                raise ValueError(
+                    "PI05Config.action_feature is required when `actual_action_dim` is not set."
+                )
+            actions = actions[:, :, : self.config.action_feature.shape[0]]
 
         return actions
 

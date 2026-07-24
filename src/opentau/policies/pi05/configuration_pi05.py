@@ -52,6 +52,9 @@ class PI05Config(PreTrainedConfig):
             Defaults to identity for visual features and mean-std for state and action.
         max_state_dim: Maximum dimension for state vectors. Shorter vectors are padded. Defaults to 32.
         max_action_dim: Maximum dimension for action vectors. Shorter vectors are padded. Defaults to 32.
+        actual_action_dim: Optional real action dimension returned by inference after
+            unnormalization. When unset, inference falls back to the configured action
+            feature dimension. Defaults to None.
         predict_response: Whether to predict the response. Defaults to False.
         resize_imgs_with_padding: Target size (height, width) for image resizing with padding.
             Defaults to (224, 224).
@@ -93,6 +96,7 @@ class PI05Config(PreTrainedConfig):
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
+    actual_action_dim: int | None = None
     predict_response: bool = False
 
     # "discrete" encodes state as binned text tokens in the language prompt;
@@ -256,6 +260,17 @@ class PI05Config(PreTrainedConfig):
             )
         if self.guidance_scale < 0.0:
             raise ValueError(f"`guidance_scale` must be non-negative. Got {self.guidance_scale}.")
+
+        if self.actual_action_dim is not None:
+            if self.actual_action_dim <= 0:
+                raise ValueError(
+                    f"`actual_action_dim` must be a positive integer. Got {self.actual_action_dim}."
+                )
+            if self.actual_action_dim > self.max_action_dim:
+                raise ValueError(
+                    "`actual_action_dim` must be <= `max_action_dim`. "
+                    f"Got {self.actual_action_dim=} and {self.max_action_dim=}."
+                )
 
         if self.n_action_steps < self.chunk_size and self.max_delay != 0:
             raise ValueError(

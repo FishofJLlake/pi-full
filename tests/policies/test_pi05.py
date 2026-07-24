@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 from einops import rearrange
@@ -23,6 +26,64 @@ from opentau.policies.pi05.modeling_pi05 import (
 
 PALIGEMMA_TOKENIZER_EOS_IDS = 1
 PALIGEMMA_TOKENIZER_PAD_IDS = 0
+
+
+class TestPI05ActualActionDim:
+    @staticmethod
+    def _policy(*, actual_action_dim, action_feature_dim=32, max_action_dim=32):
+        policy = object.__new__(PI05Policy)
+        policy.config = SimpleNamespace(
+            actual_action_dim=actual_action_dim,
+            action_feature=SimpleNamespace(shape=(action_feature_dim,)),
+            max_action_dim=max_action_dim,
+            chunk_size=4,
+            max_delay=0,
+            state_type="discrete",
+            advantage="ignore",
+            guidance_scale=1.0,
+        )
+        policy.training = False
+        policy._resolve_dataset_index = Mock(return_value=0)
+        policy.normalize_inputs = Mock(side_effect=lambda batch, dataset_index: batch)
+        policy.prepare_images = Mock(return_value=([], []))
+        policy.prepare_language = Mock(
+            return_value=(
+                torch.ones((1, 1), dtype=torch.long),
+                torch.ones((1, 1), dtype=torch.bool),
+            )
+        )
+        policy.model = SimpleNamespace(
+            sample_actions=Mock(return_value=torch.zeros((1, 4, max_action_dim)))
+        )
+        return policy
+
+    def test_explicit_dimension_truncates_after_unnormalization(self):
+        policy = self._policy(actual_action_dim=20)
+        unnormalize_shapes = []
+
+        def unnormalize(outputs, dataset_index):
+            unnormalize_shapes.append(outputs["actions"].shape)
+            return outputs
+
+        policy.unnormalize_outputs = Mock(side_effect=unnormalize)
+
+        actions = PI05Policy.sample_actions(policy, {})
+
+        assert unnormalize_shapes == [(1, 4, 32)]
+        assert actions.shape == (1, 4, 20)
+
+    def test_unset_dimension_falls_back_to_action_feature(self):
+        policy = self._policy(actual_action_dim=None, action_feature_dim=18)
+        policy.unnormalize_outputs = Mock(side_effect=lambda outputs, dataset_index: outputs)
+
+        actions = PI05Policy.sample_actions(policy, {})
+
+        assert actions.shape == (1, 4, 18)
+
+    @pytest.mark.parametrize("actual_action_dim", [0, -1, 33])
+    def test_config_rejects_invalid_actual_action_dim(self, actual_action_dim):
+        with pytest.raises(ValueError, match="actual_action_dim"):
+            PI05Config(actual_action_dim=actual_action_dim, max_action_dim=32)
 
 
 class TestPI05Integration:
