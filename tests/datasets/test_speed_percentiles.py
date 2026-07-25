@@ -72,6 +72,7 @@ def _fake_hf_dataset(per_episode_data: list[tuple[int, int, int]]):
     :func:`episode_to_task_index_from_hf_dataset`.
     """
     import torch
+
     from datasets import Dataset
 
     task_indices_col: list[int] = []

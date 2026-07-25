@@ -57,7 +57,12 @@ from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
 from opentau.policies.pi05_mem.rldx_video_encoder import RLDXVideoEncoder
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    ce_per_sample,
+    flow_matching_masked_mse,
+    freeze_policy_level_params_for_vision_only,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -349,12 +354,16 @@ class PI05MemPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -362,6 +371,8 @@ class PI05MemPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -369,6 +380,8 @@ class PI05MemPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -376,6 +389,8 @@ class PI05MemPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
@@ -383,6 +398,11 @@ class PI05MemPolicy(PreTrainedPolicy):
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
+        # Guard: a fitted FAST tokenizer bakes the discrete-action normalization
+        # convention into its BPE corpus; refuse a tokenizer whose convention
+        # disagrees with this policy's config_version (no-op for upstream/
+        # pre-versioning tokenizers, which carry no convention sidecar).
+        self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI05MemFlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
 
@@ -1010,6 +1030,7 @@ class PI05MemFlowMatching(nn.Module):
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
+            train_vision_encoder_only=self.config.train_vision_encoder_only,
             attention_implementation=self.config.attention_implementation,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
@@ -1102,6 +1123,14 @@ class PI05MemFlowMatching(nn.Module):
 
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+
+        if self.config.train_vision_encoder_only:
+            # Freeze every policy-level projection (state/action/time) so ONLY the video
+            # encoder trains. The RLDX ``video_encoder.motion_module`` is part of the video
+            # encoder and is left trainable by the helper (matched by name); the SigLIP
+            # tower + projector live under paligemma_with_expert and are already configured
+            # by its own set_requires_grad.
+            freeze_policy_level_params_for_vision_only(self, self.paligemma_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)

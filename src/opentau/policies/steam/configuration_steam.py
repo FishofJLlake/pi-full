@@ -70,8 +70,7 @@ class SteamConfig(PreTrainedConfig):
         validate_binning(self.max_temporal_offset, self.num_bins)
         if not 0 < self.length_reference_percentile <= 100:
             raise ValueError(
-                "length_reference_percentile must be in (0, 100], got "
-                f"{self.length_reference_percentile}."
+                f"length_reference_percentile must be in (0, 100], got {self.length_reference_percentile}."
             )
         if self.fusion_hidden_dim < 1:
             raise ValueError("fusion_hidden_dim must be positive.")

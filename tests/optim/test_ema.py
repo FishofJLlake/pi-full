@@ -39,10 +39,9 @@ def test_average_parameter_context_restores_live_values_after_error():
         module.weight.fill_(3.0)
     original = module.weight.detach().clone()
 
-    with pytest.raises(RuntimeError, match="sentinel"):
-        with ema.average_parameters():
-            assert torch.equal(module.weight, torch.ones_like(module.weight))
-            raise RuntimeError("sentinel")
+    with pytest.raises(RuntimeError, match="sentinel"), ema.average_parameters():
+        assert torch.equal(module.weight, torch.ones_like(module.weight))
+        raise RuntimeError("sentinel")
 
     assert torch.equal(module.weight, original)
 

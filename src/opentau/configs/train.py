@@ -233,9 +233,7 @@ class TrainPipelineConfig(HubMixin):
         )
 
         if self.ema_decay is not None and not 0.0 <= self.ema_decay < 1.0:
-            raise ValueError(
-                f"`ema_decay` must be None or in the interval [0, 1). Got {self.ema_decay}."
-            )
+            raise ValueError(f"`ema_decay` must be None or in the interval [0, 1). Got {self.ema_decay}.")
 
         if self.policy:
             self.policy.max_state_dim = self.max_state_dim

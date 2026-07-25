@@ -82,6 +82,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         gemma_expert_config: dict | None = None,
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
+        train_vision_encoder_only: bool = False,
         attention_implementation: str = "eager",
         dropout: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -94,6 +95,11 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             gemma_expert_config: Configuration dictionary for the Gemma expert model.
             freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
             train_expert_only: Whether to train only the expert model. Defaults to True.
+            train_vision_encoder_only: Mirror image of ``train_expert_only`` — freeze the
+                Gemma LLM backbone and the action expert, and train ONLY the vision pathway
+                (the SigLIP tower + the multimodal projector). Requires
+                ``freeze_vision_encoder=False`` and is incompatible with
+                ``train_expert_only=True``. Defaults to False.
             attention_implementation: Attention implementation to use ("eager", "sdpa",
                 or "fa2"). Defaults to "eager".
             dropout: Dropout probability. Defaults to 0.1.
@@ -108,6 +114,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         """
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.train_vision_encoder_only = train_vision_encoder_only
         self.attention_implementation = attention_implementation
         self.dropout = dropout
         self.gradient_checkpointing = gradient_checkpointing
@@ -198,6 +205,16 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             raise ValueError(
                 "You set `freeze_vision_encoder=False` and `train_expert_only=True` which are not compatible."
             )
+        if self.train_vision_encoder_only and self.train_expert_only:
+            raise ValueError(
+                "`train_vision_encoder_only=True` and `train_expert_only=True` are mutually exclusive."
+            )
+        if self.train_vision_encoder_only and self.freeze_vision_encoder:
+            raise ValueError(
+                "You set `train_vision_encoder_only=True` and `freeze_vision_encoder=True` which are not "
+                "compatible — the vision encoder cannot be both frozen and the only trained component. "
+                "Set `freeze_vision_encoder=False`."
+            )
         if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
@@ -244,6 +261,22 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
 
+    def _multi_modal_projector(self):
+        """Return the multimodal projector, tolerating the ``.model.`` nesting that
+        varies across transformers versions."""
+        for path in ("multi_modal_projector", "model.multi_modal_projector"):
+            obj = self.paligemma
+            ok = True
+            for part in path.split("."):
+                if hasattr(obj, part):
+                    obj = getattr(obj, part)
+                else:
+                    ok = False
+                    break
+            if ok:
+                return obj
+        return None
+
     def set_requires_grad(self) -> None:
         """Sets the requires_grad attribute for model parameters based on configuration."""
         if self.config.freeze_vision_encoder:
@@ -255,6 +288,25 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.paligemma.eval()
             for params in self.paligemma.parameters():
                 params.requires_grad = False
+
+        if self.config.train_vision_encoder_only:
+            # Mirror image of ``train_expert_only``: freeze the Gemma LLM backbone and
+            # the action expert; leave ONLY the vision pathway (SigLIP tower + multimodal
+            # projector) trainable. The frozen modules still transmit gradients, so the
+            # vision pathway's loss reaches it.
+            self.paligemma.eval()
+            for params in self.paligemma.parameters():
+                params.requires_grad = False
+            self.gemma_expert.eval()
+            for param in self.gemma_expert.parameters():
+                param.requires_grad = False
+            # Re-enable the vision pathway (SigLIP tower + multimodal projector).
+            for params in self.paligemma.vision_tower.parameters():
+                params.requires_grad = True
+            projector = self._multi_modal_projector()
+            if projector is not None:
+                for params in projector.parameters():
+                    params.requires_grad = True
 
     def train(self, mode: bool = True) -> None:
         """Sets the module in training mode.
@@ -270,8 +322,43 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         if self.config.train_expert_only:
             self.paligemma.eval()
 
+        if self.config.train_vision_encoder_only:
+            # Everything except the vision pathway is frozen -> keep it in eval.
+            self.paligemma.eval()
+            self.gemma_expert.eval()
+            self.paligemma.vision_tower.train(mode)
+            projector = self._multi_modal_projector()
+            if projector is not None:
+                projector.train(mode)
+
     def to_bfloat16_like_physical_intelligence(self) -> None:
-        """Casts specific model components to bfloat16 dtype."""
+        """Casts specific model components to bfloat16, keeping the SigLIP embeddings in float32.
+
+        Mirrors openpi's ``to_bfloat16_for_selected_params``: the bulk of the VLM runs in
+        bfloat16, but the SigLIP patch-embedding conv and the learned position-embedding table
+        are pinned to float32. The original JAX (Big Vision) SigLIP does patch extraction and
+        position embedding in float32 and only casts to the (bf16) encoder dtype afterwards
+        (``openpi/models/siglip.py``: "do patch extraction and posemb in float32"). Those two
+        tables are the only vision weights that are genuine float32 masters rather than bf16
+        masters upcast on checkpoint export, so loading their float32 values straight into
+        bf16 parameters rounds away real precision that a later ``.to(float32)`` cannot recover
+        (empirically ~0.4 max abs error in the projected image tokens). The float32 ->
+        encoder-dtype hand-off is done by the patched ``SiglipVisionTransformer.forward`` in
+        :mod:`opentau.utils.transformers_patch`.
+
+        These tables are used in the patch-conv / posemb *compute* in float32 only at
+        inference / serving / ONNX export: the inference entry points (the gRPC server,
+        ``scripts/inference.py``, ``eval.py``, ``benchmark_inference.py``,
+        ``high_level_planner_inference.py``, ``actions_mse_loss.py``) route their blanket
+        bfloat16 cast through :func:`opentau.policies.utils.to_dtype_preserving_siglip_float32`,
+        and ONNX export runs in float32. No *training* backend computes them in float32: DDP
+        and non-FSDP DeepSpeed blanket-cast the whole policy to bfloat16 (``train.py`` /
+        ``profile_step.py``), and FSDP keeps a float32 master but its
+        ``MixedPrecision(param_dtype=bfloat16)`` materializes bfloat16 compute params in the
+        all-gather. That gap is small (patch-conv compute differs ~0.14% in the image tokens,
+        ~1e-4 in the sampled actions; the default freezes the vision encoder) and is tracked
+        for a backend-specific, multi-rank-validated follow-up in issue #483.
+        """
         self.paligemma = self.paligemma.to(dtype=torch.bfloat16)
 
         params_to_change_dtype = [
@@ -283,6 +370,15 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         for name, param in self.named_parameters():
             if any(selector in name for selector in params_to_change_dtype):
                 param.data = param.data.to(dtype=torch.bfloat16)
+
+        params_to_keep_float32 = [
+            "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            "vision_tower.vision_model.embeddings.patch_embedding.bias",
+            "vision_tower.vision_model.embeddings.position_embedding.weight",
+        ]
+        for name, param in self.named_parameters():
+            if any(selector in name for selector in params_to_keep_float32):
+                param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor) -> torch.Tensor:
         """Computes image embeddings.

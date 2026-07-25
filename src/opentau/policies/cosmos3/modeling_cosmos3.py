@@ -49,7 +49,11 @@ from opentau.policies.cosmos3.qwen3vl_with_expert import Qwen3VLWithExpertModel
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.utils import PerSampleLoss, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    flow_matching_masked_mse,
+    freeze_policy_level_params_for_vision_only,
+)
 
 
 def _preferred_dtype():
@@ -146,6 +150,7 @@ class Cosmos3FlowMatching(nn.Module):
             attention_implementation=config.attention_implementation,
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
+            train_vision_encoder_only=config.train_vision_encoder_only,
             gradient_checkpointing=config.gradient_checkpointing,
             load_pretrained_backbone_repo=(
                 config.pretrained_backbone_repo_id if config.load_pretrained_backbone else None
@@ -175,6 +180,13 @@ class Cosmos3FlowMatching(nn.Module):
             self.state_proj,
         ):
             module.to(dtype=backbone_dtype)
+
+        if config.train_vision_encoder_only:
+            # Freeze every policy-level projection (action/time/adarms/state) so ONLY the
+            # Qwen3-VL vision tower trains. Its merger / deepstack projector lives inside
+            # backbone.model.visual, already configured by qwen3vl_with_expert's own
+            # set_requires_grad.
+            freeze_policy_level_params_for_vision_only(self, self.qwen3vl_with_expert)
 
     # ----- flow-matching sampling utilities (identical to pi05) -----
 
@@ -406,12 +418,16 @@ class Cosmos3Policy(PreTrainedPolicy):
         self.config = config
 
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -419,6 +435,8 @@ class Cosmos3Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -426,6 +444,8 @@ class Cosmos3Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         # The Qwen3-VL processor (tokenizer + image processor) builds the multimodal

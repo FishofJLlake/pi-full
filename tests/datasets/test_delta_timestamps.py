@@ -15,12 +15,12 @@
 from itertools import accumulate
 from unittest.mock import MagicMock, patch
 
-import datasets
 import numpy as np
 import pyarrow.compute as pc
 import pytest
 import torch
 
+import datasets
 from opentau.datasets.factory import resolve_delta_timestamps
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 from opentau.datasets.utils import check_timestamps_sync

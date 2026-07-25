@@ -122,9 +122,7 @@ def build_value_scrubber_html(
     frames_json = json.dumps(frames, ensure_ascii=False, allow_nan=False)
     max_value_label = _format_float(_finite_float_or_none(max_value), 3)
     escaped_label = html.escape(series_label.strip() or "Value")
-    curve_title = (
-        "Value Function V(s)" if escaped_label == "Value" else f"{escaped_label} Curve"
-    )
+    curve_title = "Value Function V(s)" if escaped_label == "Value" else f"{escaped_label} Curve"
 
     return f"""
 <style>

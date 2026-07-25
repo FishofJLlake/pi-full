@@ -18,12 +18,12 @@ from pathlib import Path
 from typing import Protocol
 from unittest.mock import patch
 
-import datasets
 import numpy as np
 import PIL.Image
 import pytest
 import torch
 
+import datasets
 from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset, LeRobotDatasetMetadata
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.utils import (

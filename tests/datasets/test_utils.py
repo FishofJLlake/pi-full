@@ -19,9 +19,9 @@ import logging
 
 import pytest
 import torch
-from datasets import Dataset
 from huggingface_hub import DatasetCard
 
+from datasets import Dataset
 from opentau.datasets import utils as datasets_utils
 from opentau.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
 from opentau.datasets.utils import (

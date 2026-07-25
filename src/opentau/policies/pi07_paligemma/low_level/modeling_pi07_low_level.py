@@ -40,7 +40,7 @@ from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.flash_attn_cuda import make_att_block_ids
 from opentau.policies.layers import PerGroupLinear
-from opentau.policies.normalize import EPS, Normalize, Unnormalize, _materialize
+from opentau.policies.normalize import Normalize, Unnormalize, _materialize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.outlier_utils import detect_state_action_outliers
 from opentau.policies.pi05.paligemma_with_expert import (
@@ -53,7 +53,12 @@ from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level impo
     PI07PaligemmaLowLevelConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, ProjectionRemapError, T
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    ce_per_sample,
+    flow_matching_masked_mse,
+    freeze_policy_level_params_for_vision_only,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -366,12 +371,16 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -379,6 +388,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -386,6 +397,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -393,6 +406,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
@@ -400,6 +415,11 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
+        # Guard: a fitted FAST tokenizer bakes the discrete-action normalization
+        # convention into its BPE corpus; refuse a tokenizer whose convention
+        # disagrees with this policy's config_version (no-op for upstream/
+        # pre-versioning tokenizers, which carry no convention sidecar).
+        self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI07PaligemmaLowLevelFlowMatching(
@@ -1237,9 +1257,21 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         buffer = self.normalize_discrete_actions.buffer_actions
         min_ = _materialize(buffer["min"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
         max_ = _materialize(buffer["max"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
-        denom = max_ - min_
-        denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
-        return (normalized + 1) / 2 * (denom + EPS) + min_
+        raw_range = max_ - min_
+        # Use the epsilon of the module we invert, not the module-level default: it is
+        # config_version-gated (1e-8 for a legacy checkpoint, 1e-6 at v1), so reading module `EPS`
+        # here would break the round-trip on a v0 checkpoint. Mirrors the `zero_range_center` read
+        # below — both track the convention of the paired `normalize_discrete_actions`.
+        eps = self.normalize_discrete_actions.eps
+        denom = torch.where(raw_range.abs() < eps, torch.ones_like(raw_range), raw_range)
+        recovered = (normalized + 1) / 2 * (denom + eps) + min_
+        # Mirror Unnormalize's zero_range_center inverse: subtract the numerator
+        # offset that the paired normalize_discrete_actions added (float-exact
+        # no-op on healthy dims). Gated on that module's flag so this inline path
+        # tracks the same config_version convention as the module it inverts.
+        if self.normalize_discrete_actions.zero_range_center:
+            recovered = recovered - 0.5 * (denom - raw_range)
+        return recovered
 
     def forward(
         self,
@@ -1917,6 +1949,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
+            train_vision_encoder_only=self.config.train_vision_encoder_only,
             attention_implementation=self.config.attention_implementation,
             load_pretrained_paligemma=False,
             discrete_action_vocab_size=discrete_action_vocab_size,
@@ -1961,6 +1994,13 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
+        if self.config.train_vision_encoder_only:
+            # Freeze every policy-level projection (state/action/time) so ONLY the
+            # video encoder trains. The SpaceTime video_encoder is param-less (it reuses
+            # the SigLIP tower under paligemma_with_expert, already configured by its own
+            # set_requires_grad).
+            freeze_policy_level_params_for_vision_only(self, self.paligemma_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.

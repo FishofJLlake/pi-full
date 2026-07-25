@@ -1,3 +1,17 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import math
 import os
@@ -7,9 +21,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from opentau.datasets.utils import (
-    ADVANTAGES_PATH,
     ADVANTAGE_REPORT_PATH,
     ADVANTAGE_SOURCES_PATH,
+    ADVANTAGES_PATH,
     RAW_ADVANTAGES_PATH,
     AdvantageKey,
     serialize_advantage_key,
@@ -134,9 +148,7 @@ def persist_advantage_bundle(
     )
 
     serialized_keys = {key: serialize_advantage_key(*key) for key in validated_keys}
-    advantage_payload = {
-        serialized_keys[key]: f"{float(advantages[key]):.6f}" for key in validated_keys
-    }
+    advantage_payload = {serialized_keys[key]: f"{float(advantages[key]):.6f}" for key in validated_keys}
     raw_advantage_payload = {
         serialized_keys[key]: f"{float(raw_advantages[key]):.6f}" for key in validated_keys
     }

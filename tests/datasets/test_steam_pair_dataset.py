@@ -16,8 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from datasets import Dataset as HFDataset
 
+from datasets import Dataset as HFDataset
 from opentau.datasets.steam_pair_dataset import (
     SteamPairDataset,
     set_global_length_reference,

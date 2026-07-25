@@ -52,9 +52,7 @@ class TestPI05ActualActionDim:
                 torch.ones((1, 1), dtype=torch.bool),
             )
         )
-        policy.model = SimpleNamespace(
-            sample_actions=Mock(return_value=torch.zeros((1, 4, max_action_dim)))
-        )
+        policy.model = SimpleNamespace(sample_actions=Mock(return_value=torch.zeros((1, 4, max_action_dim))))
         return policy
 
     def test_explicit_dimension_truncates_after_unnormalization(self):

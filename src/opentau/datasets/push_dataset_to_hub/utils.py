@@ -19,11 +19,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict
 
-import datasets
 import numpy
 import PIL
 import torch
 
+import datasets
 from opentau.datasets.video_utils import encode_video_frames
 
 

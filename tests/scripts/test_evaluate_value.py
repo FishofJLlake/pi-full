@@ -145,8 +145,7 @@ def test_dataset_identity_distinguishes_duplicate_repo_ids_with_different_roots(
     )
 
     identities = [
-        evaluate_value.dataset_identity(index, dataset)
-        for index, dataset in enumerate(mixture.datasets)
+        evaluate_value.dataset_identity(index, dataset) for index, dataset in enumerate(mixture.datasets)
     ]
     provenance = evaluate_value._dataset_provenance(mixture)
 
@@ -284,7 +283,9 @@ def test_main_rejects_output_overlap_before_opening_policy_or_dataset(monkeypatc
     )
 
     def fail_if_policy_or_dataset_is_opened(*args, **kwargs):
-        raise AssertionError("the overlapping output directory must be rejected before opening a policy or dataset")
+        raise AssertionError(
+            "the overlapping output directory must be rejected before opening a policy or dataset"
+        )
 
     monkeypatch.setattr(
         evaluate_value.TrainPipelineConfig,
@@ -389,12 +390,12 @@ def test_main_uses_local_dataset_and_writes_selected_episode_reports(monkeypatch
         seen["episodes"] = dataset_config.episodes
         return FakeDataset(
             [
-            {
-                "prompt": "held-out task",
-                "return_bin_idx": torch.tensor(0, dtype=torch.long),
-                "return_continuous": torch.tensor(-0.75),
-                "episode_index": 4,
-            }
+                {
+                    "prompt": "held-out task",
+                    "return_bin_idx": torch.tensor(0, dtype=torch.long),
+                    "return_continuous": torch.tensor(-0.75),
+                    "episode_index": 4,
+                }
             ]
         )
 
@@ -423,7 +424,12 @@ def test_main_uses_local_dataset_and_writes_selected_episode_reports(monkeypatch
         "checkpoint_path": "/checkpoints/value",
         "episodes": [4, 7],
         "gather_keys": {
-            "logits", "predicted_values", "target_bins", "target_values", "dataset_index", "source_index"
+            "logits",
+            "predicted_values",
+            "target_bins",
+            "target_values",
+            "dataset_index",
+            "source_index",
         },
         "waited": True,
     }

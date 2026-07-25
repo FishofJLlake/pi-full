@@ -196,9 +196,7 @@ class SteamPolicy(PreTrainedPolicy):
         images_by_camera: Mapping[str, Tensor],
         masks_by_camera: Mapping[str, Tensor] | None,
     ) -> Tensor:
-        camera_keys = [
-            key for key in self.config.image_features if key in images_by_camera
-        ]
+        camera_keys = [key for key in self.config.image_features if key in images_by_camera]
         if not camera_keys:
             camera_keys = sorted(images_by_camera)
         if not camera_keys:
@@ -210,14 +208,10 @@ class SteamPolicy(PreTrainedPolicy):
             raise ValueError("All STEAM cameras must have the same batch size.")
 
         flat_images = torch.cat(image_batches, dim=0)
-        image_context = (
-            torch.no_grad() if self.config.freeze_vision_encoder else nullcontext()
-        )
+        image_context = torch.no_grad() if self.config.freeze_vision_encoder else nullcontext()
         with image_context:
             encoded = self._encode_vision(self._preprocess_images(flat_images))
-        projected = self.image_projector(
-            encoded.to(dtype=_module_dtype(self.image_projector))
-        )
+        projected = self.image_projector(encoded.to(dtype=_module_dtype(self.image_projector)))
         projected = rearrange(
             projected, "(camera batch) hidden -> batch camera hidden", camera=len(camera_keys)
         )
@@ -259,9 +253,7 @@ class SteamPolicy(PreTrainedPolicy):
         )
         input_ids = tokenized["input_ids"].to(device)
         attention_mask = tokenized["attention_mask"].to(device)
-        language_context = (
-            torch.no_grad() if self.config.freeze_language_model else nullcontext()
-        )
+        language_context = torch.no_grad() if self.config.freeze_language_model else nullcontext()
         with language_context:
             outputs = self.language_model(
                 input_ids=input_ids,
@@ -274,9 +266,7 @@ class SteamPolicy(PreTrainedPolicy):
         weights = rearrange(attention_mask, "batch token -> batch token 1").to(dtype=hidden.dtype)
         pooled = reduce(hidden * weights, "batch token hidden -> batch hidden", "sum")
         pooled = pooled / reduce(weights, "batch token 1 -> batch 1", "sum").clamp(min=1)
-        return self.language_projector(
-            pooled.to(dtype=_module_dtype(self.language_projector))
-        )
+        return self.language_projector(pooled.to(dtype=_module_dtype(self.language_projector)))
 
     def _logits(self, batch: dict[str, Any]) -> Tensor:
         frame_t = self._encode_frame(

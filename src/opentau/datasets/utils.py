@@ -86,7 +86,6 @@ from pprint import pformat
 from types import SimpleNamespace
 from typing import Any
 
-import datasets
 import jsonlines
 import numpy as np
 import packaging.version
@@ -94,12 +93,13 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
 from huggingface_hub.errors import RevisionNotFoundError
 from PIL import Image as PILImage
 from torchvision import transforms
 
+import datasets
+from datasets.table import embed_table_storage
 from opentau.configs.types import DictLike, FeatureType, PolicyFeature
 from opentau.datasets.backward_compatibility import (
     V21_MESSAGE,
@@ -533,9 +533,7 @@ def load_advantages_from_path(
                 f"{value_name.title()} value for {serialized!r} must be finite; got {value!r}"
             ) from exc
         if not math.isfinite(numeric_value):
-            raise ValueError(
-                f"{value_name.title()} value for {serialized!r} must be finite; got {value!r}"
-            )
+            raise ValueError(f"{value_name.title()} value for {serialized!r} must be finite; got {value!r}")
         result[key] = numeric_value
     return result
 
@@ -572,9 +570,7 @@ def validate_advantage_bundle_files(
 ) -> None:
     """Validate companion files for an advantage bundle used by conditioning."""
     if advantages is None:
-        raise ValueError(
-            f"Missing {ADVANTAGES_PATH}; regenerate the complete advantage bundle."
-        )
+        raise ValueError(f"Missing {ADVANTAGES_PATH}; regenerate the complete advantage bundle.")
 
     companion_paths = {
         "raw_advantages": local_dir / RAW_ADVANTAGES_PATH,
@@ -588,9 +584,7 @@ def validate_advantage_bundle_files(
             f"{missing_files!r}. Regenerate all advantage files."
         )
 
-    raw_advantages = load_advantages_from_path(
-        companion_paths["raw_advantages"], "raw advantage"
-    )
+    raw_advantages = load_advantages_from_path(companion_paths["raw_advantages"], "raw advantage")
     sources = load_advantage_sources_from_path(companion_paths["advantage_sources"])
 
     expected_keys = set(advantages)
@@ -602,8 +596,7 @@ def validate_advantage_bundle_files(
             missing = sorted(expected_keys - keys)
             unexpected = sorted(keys - expected_keys)
             raise ValueError(
-                f"Advantage bundle key sets differ for {name}: "
-                f"missing={missing!r}, unexpected={unexpected!r}"
+                f"Advantage bundle key sets differ for {name}: missing={missing!r}, unexpected={unexpected!r}"
             )
 
     report = load_json(companion_paths["advantage_report"])

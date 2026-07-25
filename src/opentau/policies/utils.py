@@ -125,6 +125,76 @@ def get_dtype_from_parameters(module: nn.Module) -> torch.dtype:
     return next(iter(module.parameters())).dtype
 
 
+# Full parameter-name suffixes of the SigLIP patch/position embeddings that
+# PaliGemmaWithExpertModel.to_bfloat16_like_physical_intelligence pins to float32.
+_SIGLIP_FLOAT32_PARAM_SUFFIXES = (
+    "vision_tower.vision_model.embeddings.patch_embedding.weight",
+    "vision_tower.vision_model.embeddings.patch_embedding.bias",
+    "vision_tower.vision_model.embeddings.position_embedding.weight",
+)
+
+
+def to_dtype_preserving_siglip_float32(
+    module: nn.Module,
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str | None = None,
+) -> nn.Module:
+    """``module.to(...)`` that preserves the float32-pinned SigLIP patch/position embeddings.
+
+    The SigLIP patch-embedding conv and position-embedding table are pinned to float32 at
+    build time (openpi parity, see
+    ``PaliGemmaWithExpertModel.to_bfloat16_like_physical_intelligence``): Big Vision keeps
+    "patch extraction and posemb in float32", and they are the only float32-master vision
+    weights. A blanket ``policy.to(torch.bfloat16)`` in a serving / inference entry point
+    would round those tables back to bfloat16 and permanently lose precision. This wrapper
+    snapshots them before the cast and restores them (float32, on the target device)
+    afterwards, so the mixed float32-embeddings / bfloat16-encoder state the forward dtype
+    bridges expect is preserved.
+
+    Only parameters that are float32 *before* the cast are preserved, so this is a no-op for a
+    uniform-bfloat16 tower (e.g. the Gemma3 pi06/pi07 policies, whose embeddings are not
+    pinned) and for a float32 cast. This is inference/serving-only: it must not be used on the
+    distributed-training cast path, where re-introducing float32 params after the cast would
+    change how DeepSpeed/DDP partition parameters.
+
+    Known limitation (only the *weights* are kept float32, not the *input*): the serving entry
+    points still feed a bfloat16 image — e.g. ``grpc/server.py`` casts the decoded image to the
+    policy dtype — so the patch conv runs on bfloat16-precision pixels. HF
+    ``SiglipVisionEmbeddings.forward`` upcasts ``pixel_values`` to the (float32) weight dtype, so
+    there is no dtype mismatch, but the JAX recipe is a float32 *image* into the patch conv
+    ("do patch extraction and posemb in float32"). Empirically the bfloat16 image costs ~1%
+    (~1.5 max) on ``embed_image`` — larger than the ~0.14% weight-rounding this fix removes — so
+    full JAX-recipe fidelity would additionally require keeping the served image float32. Tracked
+    as a known limitation alongside issue #483.
+
+    Args:
+        module: The policy (or any module) to cast in place.
+        dtype: Target dtype for the blanket cast.
+        device: Optional target device for the cast.
+
+    Returns:
+        The same module, cast in place.
+    """
+    saved = {
+        name: param.detach().clone()
+        for name, param in module.named_parameters()
+        if param.dtype == torch.float32
+        and any(name.endswith(suffix) for suffix in _SIGLIP_FLOAT32_PARAM_SUFFIXES)
+    }
+    if device is not None:
+        module.to(device=device, dtype=dtype)
+    else:
+        module.to(dtype=dtype)
+    if saved:
+        params_by_name = dict(module.named_parameters())
+        for name, tensor in saved.items():
+            param = params_by_name.get(name)
+            if param is not None:
+                param.data = tensor.to(device=param.data.device)
+    return module
+
+
 def get_output_shape(module: nn.Module, input_shape: tuple) -> tuple:
     """Calculates the output shape of a PyTorch module given an input shape.
 
@@ -326,3 +396,35 @@ def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) 
     if unexpected_keys:
         # DO NOT UPDATE THIS MESSAGE WITHOUT UPDATING THE REGEX IN .gitlab/scripts/check_pi0_state_keys.py
         logging.warning(f"Unexpected key(s) when loading model: {unexpected_keys}")
+
+
+def freeze_policy_level_params_for_vision_only(
+    policy_module: nn.Module, with_expert_module: nn.Module
+) -> None:
+    """Freeze the policy-level (outer) parameters for ``train_vision_encoder_only``.
+
+    The vision/video encoder — the SigLIP / Gemma3 / Qwen3-VL tower plus its
+    multimodal projector — lives *inside* ``with_expert_module``; its
+    ``set_requires_grad`` has already left exactly that pathway trainable and frozen
+    the LLM backbone, action expert and discrete heads. What remains are the
+    *policy-level* projections that live on the enclosing flow-matching module
+    (``state_proj`` / ``action_in_proj`` / ``action_out_proj`` / ``time_mlp_*`` /
+    ``action_time_mlp_*`` / ``adarms_proj`` / optional modality embeddings). Those
+    must be frozen so that **only** the vision/video encoder trains.
+
+    Rather than enumerate every projection per policy (a single omission would let a
+    head silently keep training and quietly break the "vision only" contract), this
+    freezes every outer parameter that is neither part of ``with_expert_module`` nor
+    a video-encoder ``motion_module`` — the pi05_mem RLDX encoder's own temporal
+    block, which *is* part of the video encoder and stays trainable.
+
+    Args:
+        policy_module: the enclosing flow-matching / planner ``nn.Module``.
+        with_expert_module: the inner ``*WithExpertModel`` submodule whose own
+            ``set_requires_grad`` has already configured the vision pathway.
+    """
+    protected = {id(p) for p in with_expert_module.parameters()}
+    for name, param in policy_module.named_parameters():
+        if id(param) in protected or "motion_module" in name:
+            continue
+        param.requires_grad = False

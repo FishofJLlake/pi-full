@@ -24,9 +24,7 @@ from torch import Tensor
 def validate_binning(max_temporal_offset: int, num_bins: int) -> None:
     """Validate the uniform sign-preserving bin layout."""
     if max_temporal_offset < 1:
-        raise ValueError(
-            f"max_temporal_offset must be >= 1, got {max_temporal_offset}."
-        )
+        raise ValueError(f"max_temporal_offset must be >= 1, got {max_temporal_offset}.")
     if num_bins < 2 or num_bins % 2:
         raise ValueError(f"num_bins must be >= 2 and even, got {num_bins}.")
     if (2 * max_temporal_offset) % num_bins:
@@ -44,17 +42,11 @@ def signed_offset_to_bin(offset: int, max_temporal_offset: int, num_bins: int) -
             "offset must be non-zero and within max_temporal_offset; "
             f"got offset={offset}, max_temporal_offset={max_temporal_offset}."
         )
-    position = (
-        offset + max_temporal_offset
-        if offset < 0
-        else offset + max_temporal_offset - 1
-    )
+    position = offset + max_temporal_offset if offset < 0 else offset + max_temporal_offset - 1
     return int((position * num_bins) // (2 * max_temporal_offset))
 
 
-def scaled_signed_offset_to_bin(
-    scaled_offset: float, max_temporal_offset: int, num_bins: int
-) -> int:
+def scaled_signed_offset_to_bin(scaled_offset: float, max_temporal_offset: int, num_bins: int) -> int:
     """Round, sign-preserve and clamp a length-normalized temporal offset."""
     if scaled_offset == 0:
         raise ValueError("scaled_offset must be non-zero.")
@@ -87,14 +79,10 @@ def bin_centers(
     return torch.tensor(centers, device=device, dtype=dtype)
 
 
-def expected_signed_offset(
-    probabilities: Tensor, max_temporal_offset: int, num_bins: int
-) -> Tensor:
+def expected_signed_offset(probabilities: Tensor, max_temporal_offset: int, num_bins: int) -> Tensor:
     """Decode categorical probabilities to an expected signed offset."""
     if probabilities.shape[-1] != num_bins:
-        raise ValueError(
-            f"Expected probabilities[..., {num_bins}], got {tuple(probabilities.shape)}."
-        )
+        raise ValueError(f"Expected probabilities[..., {num_bins}], got {tuple(probabilities.shape)}.")
     centers = bin_centers(
         max_temporal_offset,
         num_bins,

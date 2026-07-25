@@ -20,6 +20,7 @@ for the PI05 Vision-Language-Action Flow Model. It includes settings for the mod
 optimization, scheduling, and data processing.
 """
 
+import logging
 import warnings
 from dataclasses import dataclass, field
 from typing import Literal
@@ -71,6 +72,13 @@ class PI05Config(PreTrainedConfig):
             backward compatibility but logs a warning and falls back to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
+        train_vision_encoder_only: Mirror image of ``train_expert_only`` — train ONLY the
+            vision encoder (SigLIP tower + multimodal projector) and freeze the LLM
+            backbone, the action expert, and all heads/projections. Requires
+            ``freeze_vision_encoder=False`` and is incompatible with ``train_expert_only=True``.
+            Note: with ``knowledge_insulation=True`` (the default) the action (MSE) loss is
+            detached from the VLM, so the vision encoder trains on the CE loss only — set
+            ``knowledge_insulation=False`` to train it from the action loss. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon parameter for AdamW optimizer. Defaults to 1e-8.
@@ -169,6 +177,7 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+    train_vision_encoder_only: bool = False
 
     # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
     # is detached before the action expert reads it, so the flow-matching action
@@ -205,12 +214,47 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # `{action_pos: state_pos}` in **post-index space** — positions within the action / state
+    # vectors the policy actually receives, i.e. after each dataset's `action_index` /
+    # `state_index` selection. This is NOT the parquet-space map on `DatasetConfig`: by the time
+    # a batch reaches the policy the raw columns are gone, so `make_policy` stores the map the
+    # mixture already resolved (`DatasetMixtureMetadata.delta_action_state_map`).
+    #
+    # Set automatically when training on a delta-action mixture, and persisted into the
+    # checkpoint config so serving reproduces the inverse. `sample_actions` uses it to add the
+    # conditioning state back onto the mapped dims — without it a policy trained on deltas emits
+    # deltas that the consumer reads as absolute joint targets.
+    delta_action_state_map: dict[int, int] | None = None
+
+    # Path to an openpi-style `norm_stats.json` whose stats replace the dataset-derived ones for
+    # every norm head. Intended for teacher-faithful replay of an openpi checkpoint; prefer
+    # baking correct stats into the checkpoint instead (a warning fires when this is used).
+    norm_stats_override_path: str | None = None
+
     def __post_init__(self):
         """Post-initialization validation."""
         super().__post_init__()
 
         # TODO(Steven): Validate device and amp? in all policy configs?
         """Input validation (not exhaustive)."""
+        if self.train_vision_encoder_only and self.train_expert_only:
+            raise ValueError(
+                "`train_vision_encoder_only=True` and `train_expert_only=True` are mutually exclusive."
+            )
+        if self.train_vision_encoder_only and self.freeze_vision_encoder:
+            raise ValueError(
+                "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
+                "encoder cannot be both frozen and the only trained component."
+            )
+        if self.train_vision_encoder_only and self.knowledge_insulation:
+            logging.warning(
+                "train_vision_encoder_only=True with knowledge_insulation=True: knowledge insulation "
+                "detaches the VLM prefix KV cache before the action expert, so the flow-matching "
+                "action (MSE) loss does not reach the vision encoder — it trains on the CE loss only, "
+                "and if the CE loss weight is 0 the step has no gradient path to any trainable "
+                "parameter. Set knowledge_insulation=False to train the vision encoder from the "
+                "action loss."
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
@@ -223,6 +267,22 @@ class PI05Config(PreTrainedConfig):
 
         if self.state_type not in ("discrete", "continuous"):
             raise ValueError(f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'")
+
+        if self.delta_action_state_map is not None:
+            # A JSON config round-trips object keys as strings; without coercion the map would
+            # match no action position and the inverse would silently no-op at inference.
+            try:
+                self.delta_action_state_map = {int(a): int(s) for a, s in self.delta_action_state_map.items()}
+            except (AttributeError, TypeError, ValueError) as e:
+                raise ValueError(
+                    "`delta_action_state_map` must map int action positions to int state "
+                    f"positions, got {self.delta_action_state_map!r}."
+                ) from e
+            if any(a < 0 or s < 0 for a, s in self.delta_action_state_map.items()):
+                raise ValueError(
+                    "`delta_action_state_map` positions must be non-negative, got "
+                    f"{self.delta_action_state_map!r}."
+                )
 
         if self.attention_implementation == "flash_cuda":
             raise ValueError(
@@ -238,26 +298,18 @@ class PI05Config(PreTrainedConfig):
             )
         if self.delay_sampling not in ("uniform", "exponential"):
             raise ValueError(
-                "`delay_sampling` must be one of ['uniform', 'exponential']. "
-                f"Got {self.delay_sampling}."
+                f"`delay_sampling` must be one of ['uniform', 'exponential']. Got {self.delay_sampling}."
             )
         if self.delay_exponential_decay <= 0:
             raise ValueError(
-                "`delay_exponential_decay` must be greater than 0. "
-                f"Got {self.delay_exponential_decay}."
+                f"`delay_exponential_decay` must be greater than 0. Got {self.delay_exponential_decay}."
             )
         if not 0.0 <= self.cfg_dropout <= 1.0:
-            raise ValueError(
-                f"`cfg_dropout` must be in the interval [0, 1]. Got {self.cfg_dropout}."
-            )
+            raise ValueError(f"`cfg_dropout` must be in the interval [0, 1]. Got {self.cfg_dropout}.")
         if self.advantage_threshold < 0.0:
-            raise ValueError(
-                f"`advantage_threshold` must be non-negative. Got {self.advantage_threshold}."
-            )
+            raise ValueError(f"`advantage_threshold` must be non-negative. Got {self.advantage_threshold}.")
         if self.advantage not in ("ignore", "use"):
-            raise ValueError(
-                f"advantage must be one of ['ignore', 'use']. Got {self.advantage!r}."
-            )
+            raise ValueError(f"advantage must be one of ['ignore', 'use']. Got {self.advantage!r}.")
         if self.guidance_scale < 0.0:
             raise ValueError(f"`guidance_scale` must be non-negative. Got {self.guidance_scale}.")
 

@@ -17,9 +17,9 @@ import logging
 import traceback
 from pathlib import Path
 
-from datasets import get_dataset_config_info
 from huggingface_hub import HfApi
 
+from datasets import get_dataset_config_info
 from opentau import available_datasets
 from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import INFO_PATH, write_info

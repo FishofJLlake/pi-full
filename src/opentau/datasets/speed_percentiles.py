@@ -49,8 +49,9 @@ from opentau.datasets.utils import load_jsonlines, write_jsonlines
 from opentau.utils.accelerate_utils import get_proc_accelerator
 
 if TYPE_CHECKING:
-    import datasets
     import torch
+
+    import datasets
 
 # Boundary percentiles, ascending. Length 10 by design: 11 buckets.
 SPEED_PERCENTILES: tuple[int, ...] = (5, 15, 25, 35, 45, 55, 65, 75, 85, 95)

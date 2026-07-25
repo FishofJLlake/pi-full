@@ -462,19 +462,25 @@ class TestZeroVarianceGuard:
         rec = unnorm({"observation.state": z}, idx)["observation.state"]
         torch.testing.assert_close(rec, original, atol=1e-5, rtol=1e-4)
 
-    def test_min_max_zero_range_is_bounded_and_round_trips(self):
+    @pytest.mark.parametrize("zero_range_center", [False, True])
+    def test_min_max_zero_range_is_bounded_and_round_trips(self, zero_range_center):
         features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(4,))}
         norm_map = {"ACTION": NormalizationMode.MIN_MAX}
         c = 2.0  # dim 3 is constant: min == max == c (a zero range)
         stats = [
             {"action": {"min": torch.tensor([-1.0, -1.0, -1.0, c]), "max": torch.tensor([1.0, 1.0, 1.0, c])}}
         ]
-        norm = Normalize(features, norm_map, per_dataset_stats=stats)
-        unnorm = Unnormalize(features, norm_map, per_dataset_stats=stats)
+        norm = Normalize(features, norm_map, per_dataset_stats=stats, zero_range_center=zero_range_center)
+        unnorm = Unnormalize(features, norm_map, per_dataset_stats=stats, zero_range_center=zero_range_center)
         idx = torch.zeros(1, dtype=torch.long)
         x = torch.tensor([[0.0, 0.0, 0.0, 5.0]])  # dim 3 = 5 deviates from the constant c
         z = norm({"action": x}, idx)["action"]
-        assert z[0, 3].abs().item() < 100.0  # bounded; without the snap ~ (5 - 2)/EPS ~ 3e8
+        # Bounded under both conventions; without the snap ~ (5 - 2)/EPS ~ 3e8.
+        # legacy: (3)/1*2-1 = 5; centered: (3+0.5)/1*2-1 = 6.
+        assert z[0, 3].abs().item() < 100.0
+        # Real-range dims 0..2 (x==0, min=-1, max=1) don't hit the zero-range
+        # branch, so they normalize to ~0 regardless of convention.
+        assert torch.allclose(z[0, :3], torch.zeros(3), atol=1e-6)
         rec = unnorm({"action": z}, idx)["action"]
         torch.testing.assert_close(rec, x, atol=1e-4, rtol=1e-4)
 
@@ -622,27 +628,44 @@ def test_quantile_round_trip():
     torch.testing.assert_close(y, x, atol=1e-5, rtol=1e-5)
 
 
-def test_quantile_fallback_to_min_max(caplog):
-    """Rows lacking q01/q99 fall back to min/max (converted-from-v2.1 datasets)."""
+def test_quantile_no_min_max_fallback(caplog):
+    """A row lacking q01/q99 raises — it does NOT silently degrade to min/max scaling.
+
+    openpi's quantile path has no such fallback, and letting one row scale by min/max while its
+    peers scale by quantiles puts that row's actions on a different scale from the rest of the
+    mixture. Converted-from-v2.1 datasets must have their stats recomputed instead.
+    """
     features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
     norm_map = {"ACTION": NormalizationMode.QUANTILE}
     stats = _build_quantile_stats(2)
-    # strip quantiles from row 1 -> its buffer row must equal its min/max
     del stats[1]["action"]["q01"]
     del stats[1]["action"]["q99"]
-    with caplog.at_level(logging.WARNING):
-        norm = Normalize(features, norm_map, per_dataset_stats=stats)
-    assert any("fell back" in r.getMessage() for r in caplog.records)
-
-    # row 0 uses q99=1 -> value 1.0 normalizes to +1; row 1 uses max=20 -> value 20 -> +1
-    out = norm({"action": torch.tensor([[1.0] * 3, [20.0] * 3])}, torch.tensor([0, 1]))
-    torch.testing.assert_close(out["action"], torch.ones(2, 3), atol=1e-5, rtol=1e-5)
+    with caplog.at_level(logging.WARNING), pytest.raises(KeyError, match="q01"):
+        Normalize(features, norm_map, per_dataset_stats=stats)
+    assert not any("fell back" in r.getMessage() for r in caplog.records)
 
 
 def test_quantile_missing_all_raises():
-    """A row with neither the quantile nor its min/max fallback raises KeyError."""
+    """A row with no quantile stats at all raises KeyError."""
     features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
     norm_map = {"ACTION": NormalizationMode.QUANTILE}
     stats = [{"action": {"mean": torch.zeros(3), "std": torch.ones(3)}}]
     with pytest.raises(KeyError, match="q01"):
         Normalize(features, norm_map, per_dataset_stats=stats)
+
+
+def test_quantile_does_not_clamp():
+    """Out-of-band values extend beyond [-1, 1] rather than saturating.
+
+    Pins openpi's convention (`_normalize_quantile` has no clamp). Clamping would make every
+    outlier indistinguishable at exactly +/-1, destroying the gradient signal that tells the
+    policy how far outside the band a target sat.
+    """
+    features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    norm_map = {"ACTION": NormalizationMode.QUANTILE}
+    # _build_quantile_stats row 0: q01 = -1, q99 = +1 -> band midpoint 0, half-width 1.
+    norm = Normalize(features, norm_map, per_dataset_stats=_build_quantile_stats(1))
+    out = norm({"action": torch.tensor([[3.0, -3.0, 1.0]])}, torch.tensor([0]))
+    # 3.0 is 2 half-widths above the midpoint -> +3; -3.0 -> -3; q99 itself -> +1.
+    torch.testing.assert_close(out["action"], torch.tensor([[3.0, -3.0, 1.0]]), atol=1e-5, rtol=1e-5)
+    assert out["action"].abs().max() > 1.0

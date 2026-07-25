@@ -68,6 +68,7 @@ from opentau.policies.utils import (
     assert_gemma3_input_resolution,
     ce_per_sample,
     flow_matching_masked_mse,
+    freeze_policy_level_params_for_vision_only,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -363,12 +364,16 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -376,6 +381,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -383,6 +390,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -390,6 +399,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
@@ -397,6 +408,11 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
+        # Guard: a fitted FAST tokenizer bakes the discrete-action normalization
+        # convention into its BPE corpus; refuse a tokenizer whose convention
+        # disagrees with this policy's config_version (no-op for upstream/
+        # pre-versioning tokenizers, which carry no convention sidecar).
+        self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI07LowLevelFlowMatching(
             config, discrete_action_vocab_size=discrete_action_vocab_size, num_datasets=num_datasets
@@ -1459,6 +1475,15 @@ class PI07LowLevelFlowMatching(nn.Module):
         # cross-attention prefix slice in forward()/sample_actions(), so the
         # action expert sees the same prefix length at train and inference.
         self._action_indicator_len = len(self.language_tokenizer.encode("Action: ", add_special_tokens=False))
+
+        if self.config.vlm_config.train_vision_encoder_only:
+            # Freeze every policy-level projection (state/action/time) so ONLY the
+            # video encoder trains. pi07 exposes the flag on ``vlm_config`` (like
+            # ``freeze_vision_encoder`` / ``train_expert_only``); the SigLIP tower +
+            # projector live under gemma3_with_expert and are already configured by
+            # its own set_requires_grad. The SpaceTime video_encoder is param-less
+            # (it reuses the tower), so nothing extra stays trainable there.
+            freeze_policy_level_params_for_vision_only(self, self.gemma3_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)

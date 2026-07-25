@@ -125,15 +125,13 @@ def source_quantile_thresholds(
     for source, scores in scores_by_source.items():
         fraction = fractions[source]
         if not 0 < fraction <= 1:
-            raise ValueError(
-                f"{source} positive fraction must be in (0, 1], got {fraction}."
-            )
+            raise ValueError(f"{source} positive fraction must be in (0, 1], got {fraction}.")
         if not scores:
             continue
         thresholds[source] = float(
             np.percentile(
                 np.asarray(scores, dtype=np.float64),
-                (1.0 - fraction) * 100.0,
+                100.0 - fraction * 100.0,
             )
         )
     return thresholds
@@ -215,8 +213,7 @@ def _collect_datasets(
         dataset_config.prompt_substitutions = None
         if dataset_config.steam_source not in ("expert", "non_expert"):
             raise ValueError(
-                "Every STEAM labeling dataset must set steam_source to "
-                "'expert' or 'non_expert'."
+                "Every STEAM labeling dataset must set steam_source to 'expert' or 'non_expert'."
             )
         result = make_dataset(
             dataset_config,
@@ -230,12 +227,10 @@ def _collect_datasets(
         if not isinstance(result, SteamPairDataset):
             raise TypeError(f"Expected SteamPairDataset, got {type(result).__name__}.")
         nonterminal_keys = {
-            (episode_index, frame_index)
-            for episode_index, frame_index, _ in result.frame_records
+            (episode_index, frame_index) for episode_index, frame_index, _ in result.frame_records
         }
         terminal_keys = {
-            (episode_index, frame_index)
-            for episode_index, frame_index, _ in result.terminal_records
+            (episode_index, frame_index) for episode_index, frame_index, _ in result.terminal_records
         }
         nonterminal_keys -= terminal_keys
         collected.append(
@@ -307,9 +302,7 @@ def _finalize_and_persist(
         source = bundle.config.steam_source
         values = list(bundle.minimum_advantage.values())
         if any(not np.isfinite(value) for value in values):
-            raise RuntimeError(
-                f"Not every non-terminal frame was scored for {bundle.dataset.root}."
-            )
+            raise RuntimeError(f"Not every non-terminal frame was scored for {bundle.dataset.root}.")
         scores_by_source[source].extend(values)
 
     thresholds = source_quantile_thresholds(
@@ -327,8 +320,7 @@ def _finalize_and_persist(
         raw_advantages: dict[tuple[int, int], float] = {}
         advantage_sources: dict[tuple[int, int], str] = {}
         terminal_keys = {
-            (episode_index, frame_index)
-            for episode_index, frame_index, _ in bundle.dataset.terminal_records
+            (episode_index, frame_index) for episode_index, frame_index, _ in bundle.dataset.terminal_records
         }
 
         for episode_index, frame_index, _row_index in bundle.dataset.frame_records:
@@ -374,10 +366,7 @@ def validate_checkpoint_count(checkpoints: list[Path]) -> None:
         )
     canonical_paths = {checkpoint.resolve() for checkpoint in checkpoints}
     if len(canonical_paths) != 3:
-        raise ValueError(
-            "STEAM ensemble checkpoints must be three distinct paths; "
-            f"got {checkpoints!r}."
-        )
+        raise ValueError(f"STEAM ensemble checkpoints must be three distinct paths; got {checkpoints!r}.")
 
 
 def main(args: argparse.Namespace) -> None:
@@ -417,13 +406,9 @@ def main(args: argparse.Namespace) -> None:
         member_config = _load_member_config(checkpoint, cfg.policy)
         current_signature = _architecture_signature(member_config)
         if _core_signature(member_config) != configured_core_signature:
-            raise ValueError(
-                f"STEAM member {checkpoint} is incompatible with the labeling config."
-            )
+            raise ValueError(f"STEAM member {checkpoint} is incompatible with the labeling config.")
         if member_signature is not None and current_signature != member_signature:
-            raise ValueError(
-                f"STEAM member {checkpoint} is architecture-incompatible with the first member."
-            )
+            raise ValueError(f"STEAM member {checkpoint} is architecture-incompatible with the first member.")
         member_signature = current_signature
         member_config.device = str(device)
         policy_class = get_policy_class("steam")

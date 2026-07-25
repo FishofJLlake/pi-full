@@ -119,8 +119,7 @@ def validate_output_dir_does_not_overlap_training(
     for label, path in candidates:
         if _paths_overlap(output_path, path):
             raise ValueError(
-                f"Evaluation output directory {output_path} must not overlap "
-                f"the {label} path {path}."
+                f"Evaluation output directory {output_path} must not overlap the {label} path {path}."
             )
 
 
@@ -317,9 +316,7 @@ def main(config: EvaluateValueConfig) -> None:
     accelerator.wait_for_everyone()
 
 
-def _configure_read_only_evaluation(
-    train_config: TrainPipelineConfig, mixture: DatasetMixtureConfig
-) -> None:
+def _configure_read_only_evaluation(train_config: TrainPipelineConfig, mixture: DatasetMixtureConfig) -> None:
     """Disable train-time splits and stochastic augmentation before opening dataset roots."""
     train_config.dataset_mixture = mixture
     train_config.val_freq = 0
@@ -391,9 +388,7 @@ def _task_source_names(dataset_index: int, dataset: Any) -> dict[int, str]:
 
 def _task_source_indices(dataset_index: int, dataset: Any, batch: Mapping[str, Any]) -> torch.Tensor:
     base = _base_lerobot_dataset(dataset)
-    episode_indices = (
-        torch.as_tensor(batch["episode_index"], dtype=torch.long).reshape(-1).cpu().tolist()
-    )
+    episode_indices = torch.as_tensor(batch["episode_index"], dtype=torch.long).reshape(-1).cpu().tolist()
     try:
         task_indices = [base.episode_to_task_index[int(episode)] for episode in episode_indices]
     except KeyError as exc:

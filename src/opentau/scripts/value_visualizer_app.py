@@ -44,8 +44,7 @@ from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.factory import make_dataset
-from opentau.scripts.value_artifacts import load_value_labels
-from opentau.scripts.value_artifacts import load_values
+from opentau.scripts.value_artifacts import load_value_labels, load_values
 from opentau.scripts.value_visualizer_frontend import build_scrubber_frames, build_value_scrubber_html
 
 # Hardcoded path to logo image shown in the header.
@@ -104,12 +103,8 @@ def load_frames_lerobot_cached(
     value_lookup = load_values(values_path)
 
     raw_lookup = load_values(raw_advantages_path) if raw_advantages_path is not None else {}
-    effective_lookup = (
-        load_values(effective_advantages_path) if effective_advantages_path is not None else {}
-    )
-    source_lookup = (
-        load_value_labels(advantage_sources_path) if advantage_sources_path is not None else {}
-    )
+    effective_lookup = load_values(effective_advantages_path) if effective_advantages_path is not None else {}
+    source_lookup = load_value_labels(advantage_sources_path) if advantage_sources_path is not None else {}
 
     def advantage_columns(key: tuple[int, int]) -> dict[str, object]:
         return {

@@ -121,6 +121,7 @@ def _dataset_log_summary(dataset):
         "episodes": getattr(meta, "total_episodes", None) if meta is not None else None,
     }
 
+
 # Store dataset_mixture_path before filtering (needed for parsing inside main)
 # Handle both --dataset_mixture_path=<path> and --dataset_mixture=<path> (without nested fields)
 _dataset_mixture_path_value = None
@@ -174,8 +175,7 @@ def main(cfg: TrainPipelineConfig):
 
     if not isinstance(cfg.policy, ValueConfig):
         raise ValueError(
-            "get_advantage_and_percentiles requires policy.type='value'; "
-            f"got {cfg.policy.type!r}"
+            f"get_advantage_and_percentiles requires policy.type='value'; got {cfg.policy.type!r}"
         )
     if cfg.policy.pretrained_path is None:
         raise ValueError("policy.pretrained_path must name the Value checkpoint")
@@ -306,9 +306,9 @@ def main(cfg: TrainPipelineConfig):
                 if "reward_normalizer" in batch:
                     reward_normalizers = batch["reward_normalizer"]
                 else:
-                    reward_normalizers = [
-                        cfg.policy.reward_config.reward_normalizer
-                    ] * len(batch["current_idx"])
+                    reward_normalizers = [cfg.policy.reward_config.reward_normalizer] * len(
+                        batch["current_idx"]
+                    )
                 if "intervention" in batch:
                     interventions = batch["intervention"]
                 else:
@@ -452,7 +452,7 @@ def main(cfg: TrainPipelineConfig):
                 second_pass_samples += batch_size
 
                 postprocess_start = time.perf_counter()
-                for episode_index, current_idx, key, timestamp, intervention in record_batch:
+                for episode_index, current_idx, key, _timestamp, intervention in record_batch:
                     # check if the value for the next n_steps_look_ahead steps is available, else set it to 0
                     look_ahead_idx = current_idx + cfg.policy.reward_config.N_steps_look_ahead
                     vn = values.get((episode_index, look_ahead_idx), _default0)["v0"]

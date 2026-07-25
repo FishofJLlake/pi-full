@@ -91,17 +91,13 @@ class SteamPairDataset(Dataset):
             frozen_records = tuple(records)
             self._episodes[episode_index] = frozen_records
             self.frame_records.extend(
-                (episode_index, frame_index, row_index)
-                for frame_index, row_index in frozen_records
+                (episode_index, frame_index, row_index) for frame_index, row_index in frozen_records
             )
             if frozen_records:
                 terminal_frame, terminal_row = frozen_records[-1]
-                self.terminal_records.append(
-                    (episode_index, terminal_frame, terminal_row)
-                )
+                self.terminal_records.append((episode_index, terminal_frame, terminal_row))
             self._anchors.extend(
-                (episode_index, position)
-                for position in range(max(0, len(frozen_records) - 1))
+                (episode_index, position) for position in range(max(0, len(frozen_records) - 1))
             )
 
         self.episode_lengths = tuple(len(records) for records in self._episodes.values())
@@ -125,7 +121,7 @@ class SteamPairDataset(Dataset):
 
     def shallow_copy_with_dropout(
         self, *, enable_dropout: bool, enable_prompt_substitution: bool
-    ) -> "SteamPairDataset":
+    ) -> SteamPairDataset:
         """Copy only the wrapper and delegate optional-key toggles to the base dataset."""
         cloned = copy.copy(self)
         cloned.base_dataset = self.base_dataset.shallow_copy_with_dropout(

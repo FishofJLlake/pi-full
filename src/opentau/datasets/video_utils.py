@@ -110,8 +110,9 @@ from typing import Any, ClassVar
 import pyarrow as pa
 import torch
 import torchvision
-from datasets.features.features import register_feature
 from PIL import Image
+
+from datasets.features.features import register_feature
 
 
 @functools.cache

@@ -31,7 +31,7 @@ _DEFAULT_APPROX_MAX_BYTES = 512 * 1024 * 1024
 _DEFAULT_EXACT_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
-class QuantileMemoryLimitExceeded(MemoryError):
+class QuantileMemoryLimitExceeded(MemoryError):  # noqa: N818
     """Raised before allocating a quantile buffer larger than its configured cap."""
 
 

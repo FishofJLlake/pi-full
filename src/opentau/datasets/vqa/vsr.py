@@ -25,11 +25,11 @@ from io import BytesIO
 import numpy as np
 import requests
 import torch
-from datasets import load_dataset
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from datasets import load_dataset
 from opentau import register_vqa_dataset
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.vqa.base import VQADataset

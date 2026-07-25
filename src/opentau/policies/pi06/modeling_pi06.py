@@ -56,6 +56,7 @@ from opentau.policies.utils import (
     assert_gemma3_input_resolution,
     ce_per_sample,
     flow_matching_masked_mse,
+    freeze_policy_level_params_for_vision_only,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -250,12 +251,16 @@ class PI06Policy(PreTrainedPolicy):
         self.config = config
 
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -263,6 +268,8 @@ class PI06Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -270,6 +277,8 @@ class PI06Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -277,6 +286,8 @@ class PI06Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         # π0.6 uses Gemma 3's tokenizer. The same instance is shared with the
@@ -291,6 +302,11 @@ class PI06Policy(PreTrainedPolicy):
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
+        # Guard: a fitted FAST tokenizer bakes the discrete-action normalization
+        # convention into its BPE corpus; refuse a tokenizer whose convention
+        # disagrees with this policy's config_version (no-op for upstream/
+        # pre-versioning tokenizers, which carry no convention sidecar).
+        self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI06FlowMatching(
             config,
@@ -828,6 +844,7 @@ class PI06FlowMatching(nn.Module):
         gemma3_with_expert_config = Gemma3WithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
+            train_vision_encoder_only=self.config.train_vision_encoder_only,
             attention_implementation=self.config.attention_implementation,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
@@ -864,6 +881,11 @@ class PI06FlowMatching(nn.Module):
         # weights (above), so the original 256K rows survive and only the 1024
         # new rows are freshly initialized.
         ensure_loc_tokens(self.language_tokenizer, model=self.gemma3_with_expert.gemma3)
+
+        if self.config.train_vision_encoder_only:
+            # Freeze every policy-level projection (action/time) so ONLY the vision
+            # encoder inside gemma3_with_expert trains.
+            freeze_policy_level_params_for_vision_only(self, self.gemma3_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Standard Gaussian noise (float32)."""

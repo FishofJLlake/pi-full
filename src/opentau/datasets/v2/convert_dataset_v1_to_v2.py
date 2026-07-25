@@ -111,15 +111,15 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import datasets
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import torch
-from datasets import Dataset
 from huggingface_hub import HfApi
 from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
 from safetensors.torch import load_file
 
+import datasets
+from datasets import Dataset
 from opentau.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_PARQUET_PATH,

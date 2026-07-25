@@ -128,9 +128,7 @@ def main(cfg: TrainPipelineConfig, args: argparse.Namespace):
     output_file = args.output_file
     dataset_mixture_path = args.dataset_mixture
     if not isinstance(cfg.policy, ValueConfig):
-        raise ValueError(
-            f"calculate_value requires policy.type='value'; got {cfg.policy.type!r}"
-        )
+        raise ValueError(f"calculate_value requires policy.type='value'; got {cfg.policy.type!r}")
     if args.train_config:
         logging.info("Using full train config: %s", args.train_config)
 

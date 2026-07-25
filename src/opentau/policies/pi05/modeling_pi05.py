@@ -35,6 +35,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.datasets.action_indexing import add_chunk_start_state, subtract_chunk_start_state
 from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
@@ -44,7 +45,12 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    ce_per_sample,
+    flow_matching_masked_mse,
+    freeze_policy_level_params_for_vision_only,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -252,14 +258,11 @@ def sample_training_delay(config: PI05Config, batch_size: int) -> Tensor:
         weights = torch.exp(-config.delay_exponential_decay * delays)
         return torch.multinomial(weights, batch_size, replacement=True)
     raise ValueError(
-        "`delay_sampling` must be one of ['uniform', 'exponential']. "
-        f"Got {config.delay_sampling}."
+        f"`delay_sampling` must be one of ['uniform', 'exponential']. Got {config.delay_sampling}."
     )
 
 
-def apply_classifier_free_guidance(
-    v_cond: Tensor, v_uncond: Tensor, guidance_scale: float
-) -> Tensor:
+def apply_classifier_free_guidance(v_cond: Tensor, v_uncond: Tensor, guidance_scale: float) -> Tensor:
     """Combine paired conditional and unconditional velocity predictions."""
     return v_uncond + guidance_scale * (v_cond - v_uncond)
 
@@ -291,12 +294,16 @@ class PI05Policy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -304,6 +311,8 @@ class PI05Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -311,6 +320,8 @@ class PI05Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -318,17 +329,26 @@ class PI05Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         # The same PaliGemma tokenizer instance is shared with the inner
         # `PI05FlowMatching`. The single `ensure_loc_tokens` call inside the
         # inner ctor promotes the reserved <loc0000>..<loc1023> entries on
         # both layers at once — no second load, no risk of revision drift.
-        self.language_tokenizer = AutoTokenizer.from_pretrained("/data/modelRepository/opentau/opentau_2026126103220/paligemma-3b-pt-224")
+        self.language_tokenizer = AutoTokenizer.from_pretrained(
+            "/data/modelRepository/opentau/opentau_2026126103220/paligemma-3b-pt-224"
+        )
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
+        # Guard: a fitted FAST tokenizer bakes the discrete-action normalization
+        # convention into its BPE corpus; refuse a tokenizer whose convention
+        # disagrees with this policy's config_version (no-op for upstream/
+        # pre-versioning tokenizers, which carry no convention sidecar).
+        self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI05FlowMatching(
@@ -669,6 +689,10 @@ class PI05Policy(PreTrainedPolicy):
             )
 
         dataset_index = self._resolve_dataset_index(batch)
+        # Capture the RAW state before normalization. The delta transform is defined in raw
+        # units (openpi runs `DeltaActions` ahead of `Normalize`), so both the `action_prefix`
+        # conversion and the inverse at the end of this method need un-normalized values.
+        raw_state = self._raw_state_for_delta(batch)
         batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
@@ -676,15 +700,9 @@ class PI05Policy(PreTrainedPolicy):
         bsize = lang_tokens.shape[0]
         state = self.prepare_state(batch) if self.config.state_type == "continuous" else None
 
-        use_cfg = (
-            not self.training
-            and self.config.advantage == "use"
-            and self.config.guidance_scale != 1.0
-        )
+        use_cfg = not self.training and self.config.advantage == "use" and self.config.guidance_scale != 1.0
         if use_cfg:
-            lang_tokens_uncond, lang_masks_uncond = self.prepare_language(
-                batch, force_uncond=True
-            )
+            lang_tokens_uncond, lang_masks_uncond = self.prepare_language(batch, force_uncond=True)
             lang_tokens = torch.cat([lang_tokens, lang_tokens_uncond], dim=0)
             lang_masks = torch.cat([lang_masks, lang_masks_uncond], dim=0)
             images = [torch.cat([image, image], dim=0) for image in images]
@@ -701,6 +719,14 @@ class PI05Policy(PreTrainedPolicy):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
         else:
+            # The prefix comes off `_action_queue`, which holds ABSOLUTE actions (this method
+            # returns absolute ones), so it must be converted back into the delta space the
+            # model was trained in before being normalized against the delta stats. Skipping
+            # this silently corrupts every queue replenish after the first chunk.
+            if raw_state is not None:
+                action_prefix = subtract_chunk_start_state(
+                    action_prefix, raw_state, self.config.delta_action_state_map
+                )
             # normalize action_prefix and pad chunk dimension to config.chunk_size
             action_prefix = self.normalize_targets({"actions": action_prefix}, dataset_index)["actions"]
             action_prefix = F.pad(  # noop if chunk_size is already the same as action_prefix.shape[1]
@@ -722,6 +748,13 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
 
+        if raw_state is not None:
+            # openpi pairs `DeltaActions` on the input side with `AbsoluteActions` on the output
+            # side. Without this half the policy returns displacements that the consumer reads
+            # as absolute joint targets - a failure that looks like a badly-trained policy
+            # rather than a missing transform.
+            actions = add_chunk_start_state(actions, raw_state, self.config.delta_action_state_map)
+
         # Unpad only after unnormalization, whose statistics are stored at the
         # padded action-feature width. An explicit deployment dimension takes
         # precedence so checkpoints with a padded 32-D action feature can return
@@ -730,12 +763,38 @@ class PI05Policy(PreTrainedPolicy):
             actions = actions[:, :, : self.config.actual_action_dim]
         else:
             if self.config.action_feature is None:
-                raise ValueError(
-                    "PI05Config.action_feature is required when `actual_action_dim` is not set."
-                )
+                raise ValueError("PI05Config.action_feature is required when `actual_action_dim` is not set.")
             actions = actions[:, :, : self.config.action_feature.shape[0]]
 
         return actions
+
+    def _raw_state_for_delta(self, batch: dict[str, Tensor]) -> Tensor | None:
+        """Return the un-normalized state needed to invert the delta transform, or ``None``.
+
+        ``None`` means this policy trains on absolute actions and no inverse is required.
+
+        Args:
+            batch: The inference batch, before ``normalize_inputs`` has run.
+
+        Returns:
+            A detached copy of the raw ``state`` tensor, or ``None``.
+
+        Raises:
+            KeyError: If a delta map is configured but the batch carries no ``state``. The
+                inverse is impossible without it, and silently returning deltas would emit
+                actions in the wrong space rather than failing.
+        """
+        delta_map = getattr(self.config, "delta_action_state_map", None)
+        if not delta_map:
+            return None
+        if "state" not in batch:
+            raise KeyError(
+                "delta_action_state_map is configured, so sample_actions must add the "
+                "conditioning state back onto its output, but the batch has no 'state' key "
+                f"(got {sorted(batch)}). Without it the returned actions would be "
+                "displacements masquerading as absolute targets."
+            )
+        return batch["state"].detach().clone()
 
     def forward(
         self,
@@ -964,10 +1023,7 @@ class PI05Policy(PreTrainedPolicy):
         if self.config.advantage == "use":
             if "advantage" in batch:
                 advantage_values = (
-                    torch.as_tensor(batch["advantage"], dtype=torch.float32)
-                    .reshape(-1)
-                    .cpu()
-                    .tolist()
+                    torch.as_tensor(batch["advantage"], dtype=torch.float32).reshape(-1).cpu().tolist()
                 )
                 if len(advantage_values) != len(tasks):
                     raise ValueError(
@@ -983,8 +1039,8 @@ class PI05Policy(PreTrainedPolicy):
 
             if self.training and not force_uncond and self.config.cfg_dropout > 0.0:
                 drop_condition = (
-                    torch.rand(len(tasks), device=device) < self.config.cfg_dropout
-                ).cpu().tolist()
+                    (torch.rand(len(tasks), device=device) < self.config.cfg_dropout).cpu().tolist()
+                )
             else:
                 drop_condition = [False] * len(tasks)
 
@@ -1000,19 +1056,13 @@ class PI05Policy(PreTrainedPolicy):
                 else:
                     label = "none"
                 labels.append(label)
-            tasks = [
-                f"{task} Advantage: {label}"
-                for task, label in zip(tasks, labels, strict=True)
-            ]
+            tasks = [f"{task} Advantage: {label}" for task, label in zip(tasks, labels, strict=True)]
 
         if self.config.state_type == "continuous":
             prompt = [f"Task: {task}, " for task in tasks]
         else:
             state = self.prepare_discrete_state(batch)
-            prompt = [
-                f"Task: {task}, State: {state};\n"
-                for task, state in zip(tasks, state, strict=False)
-            ]
+            prompt = [f"Task: {task}, State: {state};\n" for task, state in zip(tasks, state, strict=False)]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -1122,6 +1172,7 @@ class PI05FlowMatching(nn.Module):
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
+            train_vision_encoder_only=self.config.train_vision_encoder_only,
             attention_implementation=self.config.attention_implementation,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
@@ -1162,6 +1213,12 @@ class PI05FlowMatching(nn.Module):
         # match mode (no new IDs, no embedding resize on PaliGemma) and
         # mutates the shared tokenizer instance for `PI05Policy` too.
         ensure_loc_tokens(self.language_tokenizer)
+
+        if self.config.train_vision_encoder_only:
+            # Freeze every policy-level projection (state/action/time + optional
+            # modality embeddings) so ONLY the vision encoder inside
+            # paligemma_with_expert trains.
+            freeze_policy_level_params_for_vision_only(self, self.paligemma_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.

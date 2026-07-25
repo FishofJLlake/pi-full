@@ -21,7 +21,6 @@ import math
 import operator
 from pathlib import Path
 
-
 ValueKey = tuple[int, int]
 
 
@@ -103,8 +102,6 @@ def load_value_labels(path: Path) -> dict[ValueKey, str]:
         serialized_keys.add(serialized)
         key = _parse_value_key(serialized)
         if not isinstance(value, str) or not value:
-            raise ValueError(
-                f"Label for {serialized!r} must be a non-empty string; got {value!r}"
-            )
+            raise ValueError(f"Label for {serialized!r} must be a non-empty string; got {value!r}")
         labels[key] = value
     return labels
