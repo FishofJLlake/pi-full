@@ -41,6 +41,7 @@ def test_conditioning_defaults_preserve_existing_behavior():
     assert config.cfg_dropout == 0.0
     assert config.guidance_scale == 1.0
     assert config.delay_sampling == "uniform"
+    assert config.delay_exponential_decay == 0.5
 
 
 @pytest.mark.parametrize(
@@ -51,6 +52,7 @@ def test_conditioning_defaults_preserve_existing_behavior():
         ("cfg_dropout", 1.1),
         ("guidance_scale", -0.1),
         ("delay_exponential_decay", 0.0),
+        ("delay_exponential_decay", 1.1),
         ("advantage", "invalid"),
     ],
 )
@@ -64,19 +66,28 @@ def test_uniform_delay_keeps_legacy_randint_sequence():
     torch.manual_seed(123)
     expected = torch.randint(0, config.max_delay + 1, (32,))
     torch.manual_seed(123)
-    actual = sample_training_delay(config, 32)
+    actual = sample_training_delay(config, 32, "cpu")
     assert torch.equal(actual, expected)
 
 
-def test_exponential_delay_is_deterministic_and_favors_short_delays():
-    config = _config(delay_sampling="exponential", delay_exponential_decay=1.0)
-    torch.manual_seed(9)
-    first = sample_training_delay(config, 4_000)
-    torch.manual_seed(9)
-    second = sample_training_delay(config, 4_000)
-    assert torch.equal(first, second)
-    counts = torch.bincount(first, minlength=config.max_delay + 1)
-    assert torch.all(counts[:-1] > counts[1:])
+def test_exponential_delay_uses_multiplicative_weights(monkeypatch):
+    config = _config(delay_sampling="exponential", delay_exponential_decay=0.5)
+    captured = {}
+
+    def fake_multinomial(weights, num_samples, replacement):
+        captured["weights"] = weights.detach().cpu()
+        captured["num_samples"] = num_samples
+        captured["replacement"] = replacement
+        return torch.zeros(num_samples, dtype=torch.long, device=weights.device)
+
+    monkeypatch.setattr(torch, "multinomial", fake_multinomial)
+
+    delays = sample_training_delay(config, 3, "cpu")
+
+    assert torch.equal(delays, torch.zeros(3, dtype=torch.long))
+    assert captured["num_samples"] == 3
+    assert captured["replacement"] is True
+    assert torch.equal(captured["weights"], torch.tensor([1.0, 0.5, 0.25, 0.125]))
 
 
 def test_cfg_formula_supports_interpolation_and_extrapolation():
@@ -163,14 +174,25 @@ def test_cfg_dropout_uses_torch_rng_per_sample():
 
 
 class _EmbeddingStub(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_inputs = []
+        self.forward_calls = []
+
     def embed_image(self, image):
         return torch.zeros(image.shape[0], 2, 4)
 
     def embed_language_tokens(self, tokens):
+        self.language_inputs.append(tokens.detach().clone())
         return torch.zeros(tokens.shape[0], tokens.shape[1], 4)
 
     def embed_discrete_actions(self, tokens):
         return torch.zeros(tokens.shape[0], tokens.shape[1], 4)
+
+    def forward(self, **kwargs):
+        self.forward_calls.append(kwargs)
+        embeddings = kwargs["inputs_embeds"][0]
+        return (torch.zeros_like(embeddings), None), "updated-cache"
 
 
 class _IndicatorTokenizer:
@@ -210,3 +232,81 @@ def test_action_indicator_is_valid_context_for_variable_prompts_and_responses():
     assert torch.all(action_indicator)
     assert torch.all(ce_context[:, 0])
     assert torch.equal(ce_context[:, 1:], action_masks[:, :-1])
+
+
+def test_flow_prefix_includes_action_indicator_but_not_discrete_targets():
+    model = object.__new__(PI05FlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        state_type="discrete",
+        predict_response=False,
+        use_modality_embedding=False,
+    )
+    model.paligemma_with_expert = _EmbeddingStub()
+    model.language_tokenizer = _IndicatorTokenizer()
+
+    _, inference_masks, inference_att_masks, inference_segments = PI05FlowMatching.embed_prefix(
+        model,
+        images=[torch.zeros(2, 3, 8, 8)],
+        img_masks=[torch.ones(2, dtype=torch.bool)],
+        lang_tokens=torch.ones(2, 5, dtype=torch.long),
+        lang_masks=torch.ones(2, 5, dtype=torch.bool),
+    )
+    assert inference_masks.shape[1] == 2 + 5 + 3
+    assert torch.all(inference_masks[:, -3:])
+    assert not torch.any(inference_att_masks[:, -3:])
+    assert torch.all(
+        inference_segments[:, -3:] == PI05FlowMatching._MODALITY_LANGUAGE
+    )
+    assert torch.equal(
+        model.paligemma_with_expert.language_inputs[-1],
+        torch.tensor([[7, 8, 9], [7, 8, 9]]),
+    )
+
+    action_masks = torch.ones(2, 4, dtype=torch.bool)
+    _, pad_masks, att_masks, segment_ids = PI05FlowMatching.embed_prefix(
+        model,
+        images=[torch.zeros(2, 3, 8, 8)],
+        img_masks=[torch.ones(2, dtype=torch.bool)],
+        lang_tokens=torch.ones(2, 5, dtype=torch.long),
+        lang_masks=torch.ones(2, 5, dtype=torch.bool),
+        discrete_actions=torch.ones(2, 4, dtype=torch.long),
+        discrete_action_masks=action_masks,
+    )
+
+    flow_prefix_length = pad_masks.shape[1] - action_masks.shape[1]
+    action_indicator = slice(flow_prefix_length - 3, flow_prefix_length)
+    discrete_targets = slice(flow_prefix_length, None)
+    assert torch.equal(
+        model.paligemma_with_expert.language_inputs[-1],
+        torch.tensor([[7, 8, 9], [7, 8, 9]]),
+    )
+    assert torch.all(pad_masks[:, action_indicator])
+    assert not torch.any(att_masks[:, action_indicator])
+    assert torch.all(segment_ids[:, action_indicator] == PI05FlowMatching._MODALITY_LANGUAGE)
+    assert torch.all(att_masks[:, discrete_targets])
+    assert torch.all(
+        segment_ids[:, discrete_targets] == PI05FlowMatching._MODALITY_DISCRETE_ACTION
+    )
+
+
+def test_response_inference_appends_action_indicator_to_flow_cache():
+    model = object.__new__(PI05FlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(use_modality_embedding=False)
+    model.paligemma_with_expert = _EmbeddingStub()
+    model.language_tokenizer = _IndicatorTokenizer()
+
+    prefix_pad_masks = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool)
+    prefix_offsets = prefix_pad_masks.long().sum(dim=1, keepdim=True) - 1
+    updated_masks, updated_offsets, updated_cache = model._append_action_indicator_to_cache(
+        prefix_pad_masks, "old-cache", prefix_offsets
+    )
+
+    assert updated_cache == "updated-cache"
+    assert torch.equal(updated_masks[:, -3:], torch.ones(2, 3, dtype=torch.bool))
+    assert torch.equal(updated_offsets, prefix_offsets + 3)
+    forward_call = model.paligemma_with_expert.forward_calls[-1]
+    assert forward_call["past_key_values"] == "old-cache"
+    assert forward_call["n_cross_att_tokens"] == prefix_pad_masks.shape[1] + 3
+    assert forward_call["inputs_embeds"][0].shape[1] == 3

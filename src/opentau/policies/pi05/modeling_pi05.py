@@ -244,22 +244,22 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
-def sample_training_delay(config: PI05Config, batch_size: int) -> Tensor:
-    """Sample per-example training delays with the configured discrete law.
+def sample_training_delay(
+    config: PI05Config, batch_size: int, device: torch.device | str
+) -> Tensor:
+    """Sample RTC training delays according to the configured strategy."""
+    if config.max_delay == 0:
+        return torch.zeros(batch_size, dtype=torch.long, device=device)
 
-    Uniform sampling intentionally uses the same `torch.randint` call shape as
-    the existing implementation. Exponential sampling assigns delay `d`
-    probability proportional to `exp(-decay * d)`.
-    """
     if config.delay_sampling == "uniform":
-        return torch.randint(0, config.max_delay + 1, (batch_size,))
-    if config.delay_sampling == "exponential":
-        delays = torch.arange(config.max_delay + 1, dtype=torch.float32)
-        weights = torch.exp(-config.delay_exponential_decay * delays)
-        return torch.multinomial(weights, batch_size, replacement=True)
-    raise ValueError(
-        f"`delay_sampling` must be one of ['uniform', 'exponential']. Got {config.delay_sampling}."
+        return torch.randint(0, config.max_delay + 1, (batch_size,), device=device)
+
+    delay_values = torch.arange(config.max_delay + 1, device=device)
+    weights = torch.pow(
+        torch.as_tensor(config.delay_exponential_decay, dtype=torch.float32, device=device),
+        delay_values.to(dtype=torch.float32),
     )
+    return torch.multinomial(weights, batch_size, replacement=True).to(dtype=torch.long)
 
 
 def apply_classifier_free_guidance(v_cond: Tensor, v_uncond: Tensor, guidance_scale: float) -> Tensor:
@@ -1254,6 +1254,32 @@ class PI05FlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
+    def _embed_action_indicator(
+        self, batch_size: int, device: torch.device | str
+    ) -> tuple[Tensor, Tensor]:
+        """Embed the shared ``Action: `` context seen by the flow expert."""
+        action_indicator_ids = self.language_tokenizer.encode(
+            "Action: ", add_special_tokens=False
+        )
+        action_indicator_tokens = torch.tensor(
+            [action_indicator_ids] * batch_size,
+            device=device,
+            dtype=torch.long,
+        )
+        action_indicator_emb = self.paligemma_with_expert.embed_language_tokens(
+            action_indicator_tokens
+        )
+        action_indicator_emb = action_indicator_emb * math.sqrt(
+            action_indicator_emb.shape[-1]
+        )
+        action_indicator_mask = torch.ones(
+            batch_size,
+            action_indicator_emb.shape[1],
+            dtype=torch.bool,
+            device=device,
+        )
+        return action_indicator_emb, action_indicator_mask
+
     def embed_prefix(
         self,
         images: list[Tensor],
@@ -1412,27 +1438,28 @@ class PI05FlowMatching(nn.Module):
             att_masks += [1] * num_response_embs
             segment_ids += [self._MODALITY_RESPONSE] * num_response_embs
 
-        if discrete_actions is not None:
-            discrete_action_indicator_ids = self.language_tokenizer.encode(
-                "Action: ", add_special_tokens=False
+        # ``Action: `` is shared flow context, not part of the discrete-action
+        # target span. Keep it in both training and flow-only inference. When a
+        # response is generated autoregressively, it is appended after the
+        # response by ``_append_action_indicator_to_cache`` instead.
+        include_action_indicator = discrete_actions is not None or not self.config.predict_response
+        if include_action_indicator:
+            action_indicator_emb, action_indicator_mask = self._embed_action_indicator(
+                bsize, lang_tokens.device
             )
-            discrete_action_indicator_tokens = torch.tensor(
-                [discrete_action_indicator_ids] * bsize, device=lang_tokens.device
-            )
-            discrete_action_indicator_emb = self.paligemma_with_expert.embed_language_tokens(
-                discrete_action_indicator_tokens
-            )
-            discrete_action_indicator_emb = discrete_action_indicator_emb * math.sqrt(
-                discrete_action_indicator_emb.shape[-1]
-            )
-            discrete_action_indicator_mask = torch.ones(
-                bsize, discrete_action_indicator_emb.shape[1], dtype=torch.bool, device=lang_tokens.device
-            )
-            embs.append(discrete_action_indicator_emb)
-            pad_masks.append(discrete_action_indicator_mask)
-            att_masks += [1] * discrete_action_indicator_emb.shape[1]
-            segment_ids += [self._MODALITY_DISCRETE_ACTION] * discrete_action_indicator_emb.shape[1]
+            embs.append(action_indicator_emb)
+            pad_masks.append(action_indicator_mask)
+            if self.config.predict_response:
+                # Start one causal block after the response, without leaking
+                # the indicator into response-token predictions.
+                att_masks += [1] + [0] * (action_indicator_emb.shape[1] - 1)
+            else:
+                # Standard pi0.5 treats ``Action: `` as part of the
+                # bidirectional language prefix, matching openpi.
+                att_masks += [0] * action_indicator_emb.shape[1]
+            segment_ids += [self._MODALITY_LANGUAGE] * action_indicator_emb.shape[1]
 
+        if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
             embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
             pad_masks.append(discrete_action_masks)
@@ -1454,6 +1481,60 @@ class PI05FlowMatching(nn.Module):
             embs = embs + modality_emb.to(dtype=embs.dtype)
 
         return embs, pad_masks, att_masks, segment_ids
+
+    def _append_action_indicator_to_cache(
+        self,
+        prefix_pad_masks: Tensor,
+        past_key_values: list[dict[str, Tensor]],
+        prefix_offsets: Tensor,
+    ) -> tuple[Tensor, Tensor, list[dict[str, Tensor]]]:
+        """Append ``Action: `` after an autoregressively generated response."""
+        batch_size = prefix_pad_masks.shape[0]
+        device = prefix_pad_masks.device
+        action_indicator_emb, action_indicator_mask = self._embed_action_indicator(
+            batch_size, device
+        )
+        if self.config.use_modality_embedding:
+            action_segment_ids = torch.full(
+                action_indicator_mask.shape,
+                self._MODALITY_LANGUAGE,
+                dtype=torch.long,
+                device=device,
+            )
+            action_indicator_emb = action_indicator_emb + self.modality_embedding(
+                action_segment_ids
+            ).to(dtype=action_indicator_emb.dtype)
+
+        # The response is already cached, so this new bidirectional text block
+        # can attend to the response while the response cannot attend forward to it.
+        action_indicator_att_masks = torch.zeros_like(action_indicator_mask)
+        action_indicator_att_masks[:, 0] = True
+        action_indicator_attention_mask = make_att_2d_masks(
+            action_indicator_mask,
+            action_indicator_att_masks,
+            n_cross_att_tokens=prefix_pad_masks.shape[1],
+            cross_att_pad_masks=prefix_pad_masks,
+        )
+        action_indicator_position_ids = prefix_offsets + torch.cumsum(
+            action_indicator_mask.long(), dim=1
+        )
+        prefix_pad_masks = torch.cat(
+            [prefix_pad_masks, action_indicator_mask], dim=1
+        )
+
+        (_, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=action_indicator_attention_mask,
+            position_ids=action_indicator_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[action_indicator_emb, None],
+            n_cross_att_tokens=prefix_pad_masks.shape[1],
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+        prefix_offsets = prefix_offsets + action_indicator_mask.long().sum(
+            dim=1, keepdim=True
+        )
+        return prefix_pad_masks, prefix_offsets, past_key_values
 
     def embed_suffix(self, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
@@ -1578,12 +1659,8 @@ class PI05FlowMatching(nn.Module):
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # avoids using discrete action for predicting continuous flow matching action
-        num_cross_att_tokens = (
-            prefix_embs.shape[1]
-            - self.config.discrete_action_indicator_max_length
-            - self.config.discrete_action_max_length
-        )
+        # ``Action: `` is shared context; only discrete action targets are excluded.
+        num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=vlm_2d_attention_mask,
@@ -1604,11 +1681,10 @@ class PI05FlowMatching(nn.Module):
             time = self.sample_time(batch_size, actions.device)
 
         # handle real time inference delay
-        delay = sample_training_delay(self.config, batch_size)
-        prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(
-            delay, "b -> b 1"
-        )
-        prefix_mask = prefix_mask.to(device=actions.device)
+        delay = sample_training_delay(self.config, batch_size, actions.device)
+        prefix_mask = rearrange(
+            torch.arange(self.config.chunk_size, device=actions.device), "c -> 1 c"
+        ) < rearrange(delay, "b -> b 1")
         time = torch.where(
             prefix_mask, 0, rearrange(time, "b -> b 1")
         )  # using diffusion time 0 instead of flow matching time 1
@@ -1625,12 +1701,9 @@ class PI05FlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the discrete action tokens as well as the discrete action indicator tokens when numbering the position ids for the action expert
+        # Skip only discrete action targets; ``Action: `` belongs to the flow prefix.
         prefix_offsets = torch.sum(
-            prefix_pad_masks[
-                :,
-                : -self.config.discrete_action_indicator_max_length - self.config.discrete_action_max_length,
-            ],
+            prefix_pad_masks[:, : -self.config.discrete_action_max_length],
             dim=-1,
         )[:, None]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
@@ -1857,6 +1930,14 @@ class PI05FlowMatching(nn.Module):
                     prefix_bsize,
                     device,
                 )
+
+            (
+                prefix_pad_masks,
+                prefix_offsets,
+                past_key_values,
+            ) = self._append_action_indicator_to_cache(
+                prefix_pad_masks, past_key_values, prefix_offsets
+            )
 
         # perform denoising steps to get the action
         dt = -1.0 / self.config.num_steps

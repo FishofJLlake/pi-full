@@ -66,6 +66,11 @@ class PI05Config(PreTrainedConfig):
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
+        delay_sampling: Delay sampling strategy used during training-time RTC conditioning.
+            "uniform" samples every delay equally; "exponential" samples lower delays more often.
+            Defaults to "uniform".
+        delay_exponential_decay: Multiplicative decay factor for exponential delay sampling.
+            Delay d receives weight delay_exponential_decay ** d. Defaults to 0.5.
         attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
             Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
             (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
@@ -150,7 +155,7 @@ class PI05Config(PreTrainedConfig):
     # maximum number of frozen actions
     max_delay: int = 0
     delay_sampling: Literal["uniform", "exponential"] = "uniform"
-    delay_exponential_decay: float = 1.0
+    delay_exponential_decay: float = 0.5
 
     # Advantage conditioning. Disabled by default to preserve existing prompts.
     advantage: Literal["ignore", "use"] = "ignore"
@@ -300,9 +305,10 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"`delay_sampling` must be one of ['uniform', 'exponential']. Got {self.delay_sampling}."
             )
-        if self.delay_exponential_decay <= 0:
+        if not 0 < self.delay_exponential_decay <= 1:
             raise ValueError(
-                f"`delay_exponential_decay` must be greater than 0. Got {self.delay_exponential_decay}."
+                "`delay_exponential_decay` must be in the interval (0, 1]. "
+                f"Got {self.delay_exponential_decay}."
             )
         if not 0.0 <= self.cfg_dropout <= 1.0:
             raise ValueError(f"`cfg_dropout` must be in the interval [0, 1]. Got {self.cfg_dropout}.")
