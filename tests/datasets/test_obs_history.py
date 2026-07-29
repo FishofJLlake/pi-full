@@ -28,6 +28,7 @@ from opentau.datasets.factory import resolve_delta_timestamps
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.transforms import ImageTransformsConfig
+from opentau.policies.steam.configuration_steam import SteamConfig
 from tests.fixtures.constants import DUMMY_REPO_ID
 
 
@@ -469,6 +470,53 @@ class TestResizeWithPadBatch:
         img = torch.rand(3, 100, 80)
         result = self._resize(img, 48, 64)
         assert result.shape == (3, 64, 48)
+
+    def test_default_padding_stays_on_left_and_top(self):
+        img = torch.ones(3, 1, 4)
+
+        result = self._resize(img, width=4, height=4)
+
+        torch.testing.assert_close(result[:, :3], torch.zeros(3, 3, 4))
+        torch.testing.assert_close(result[:, 3:], torch.ones(3, 1, 4))
+
+    def test_center_padding_splits_odd_padding(self):
+        img = torch.ones(3, 1, 4)
+
+        result = BaseDataset.resize_with_pad(
+            None,
+            img,
+            width=4,
+            height=4,
+            center_padding=True,
+        )
+
+        torch.testing.assert_close(result[:, :1], torch.zeros(3, 1, 4))
+        torch.testing.assert_close(result[:, 1:2], torch.ones(3, 1, 4))
+        torch.testing.assert_close(result[:, 2:], torch.zeros(3, 2, 4))
+
+    def test_steam_standardization_uses_center_padding(self):
+        class PaddingDataset(BaseDataset):
+            def _get_feature_mapping_key(self):
+                return "unused"
+
+        cfg = MagicMock()
+        cfg.resolution = (4, 4)
+        cfg.num_cams = 1
+        cfg.max_state_dim = 1
+        cfg.max_action_dim = 1
+        cfg.action_chunk = 1
+        cfg.dataset_mixture = None
+        cfg.policy = SteamConfig()
+        dataset = PaddingDataset(cfg)
+        dataset._data_features_name_mapping = {"camera0": "image"}
+        standard_item = {}
+
+        dataset._standardize_images({"image": torch.ones(3, 1, 4)}, standard_item, n_cams=1)
+
+        assert dataset.center_image_padding is True
+        torch.testing.assert_close(standard_item["camera0"][:, :1], torch.zeros(3, 1, 4))
+        torch.testing.assert_close(standard_item["camera0"][:, 1:2], torch.ones(3, 1, 4))
+        torch.testing.assert_close(standard_item["camera0"][:, 2:], torch.zeros(3, 2, 4))
 
     def test_batched_output_is_4d(self):
         imgs = torch.rand(5, 3, 100, 80)

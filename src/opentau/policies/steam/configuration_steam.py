@@ -55,13 +55,13 @@ class SteamConfig(PreTrainedConfig):
     freeze_language_model: bool = False
     use_gradient_checkpointing: bool = True
 
-    optimizer_lr: float = 5e-5
+    optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-10
     scheduler_warmup_steps: int = 1_000
-    scheduler_decay_steps: int = 30_000
-    scheduler_decay_lr: float = 5e-6
+    scheduler_decay_steps: int = 20_000
+    scheduler_decay_lr: float = 1e-5
 
     def __post_init__(self) -> None:
         super().__post_init__()

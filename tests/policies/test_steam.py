@@ -56,6 +56,19 @@ def test_steam_config_rejects_an_invalid_bin_layout():
         SteamConfig(max_temporal_offset=3, num_bins=4)
 
 
+def test_steam_training_preset_uses_requested_learning_rate_schedule():
+    config = SteamConfig()
+
+    optimizer = config.get_optimizer_preset()
+    scheduler = config.get_scheduler_preset()
+
+    assert optimizer.lr == 1e-4
+    assert scheduler.num_warmup_steps == 1_000
+    assert scheduler.num_decay_steps == 20_000
+    assert scheduler.peak_lr == 1e-4
+    assert scheduler.decay_lr == 1e-5
+
+
 def test_gradient_checkpointing_uses_non_reentrant_path():
     calls = []
     module = SimpleNamespace(gradient_checkpointing_enable=lambda **kwargs: calls.append(kwargs))

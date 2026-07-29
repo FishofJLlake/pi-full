@@ -165,6 +165,7 @@ from opentau.datasets.video_utils import (
     get_video_info,
     resample_and_trim_video,
 )
+from opentau.policies.steam.configuration_steam import SteamConfig
 from opentau.policies.value.configuration_value import ValueConfig
 from opentau.policies.value.reward import (
     calculate_return_bins_with_equal_width,
@@ -798,6 +799,9 @@ class BaseDataset(torch.utils.data.Dataset):
     # Recomputed delta-action stats (post-index space), attached by `make_dataset` for
     # delta-action datasets and consumed by `DatasetMixtureMetadata`.
     delta_action_stats: dict | None = None
+    # Preserve left/top padding for test doubles and subclasses that bypass
+    # BaseDataset.__init__; STEAM instances override this during initialization.
+    center_image_padding: bool = False
 
     # Per-instance feature-name mapping. When set (LeRobotDataset receives it
     # from the mixture entry's `data_features_name_mapping`), it wins over the
@@ -837,6 +841,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.max_state_dim = cfg.max_state_dim  # maximum dimension of the state vector
         self.max_action_dim = cfg.max_action_dim  # maximum dimension of the action vector
         self.action_chunk = cfg.action_chunk  # number of actions to be processed in a chunk
+        self.center_image_padding = isinstance(cfg.policy, SteamConfig)
         dm = cfg.dataset_mixture
         self.n_obs_history = dm.n_obs_history if dm else None
         # Optional-key dropout probabilities (all default to 0 when no mixture config is
@@ -972,7 +977,11 @@ class BaseDataset(torch.utils.data.Dataset):
                 if self.n_obs_history == 1 and img.ndim == 3:
                     img = rearrange(img, "c h w -> 1 c h w")
                 standard_item[std_key] = self.resize_with_pad(
-                    img, self.resolution[1], self.resolution[0], pad_value=0
+                    img,
+                    self.resolution[1],
+                    self.resolution[0],
+                    pad_value=0,
+                    center_padding=self.center_image_padding,
                 )
                 # Per-frame temporal padding info (from clamped episode boundaries) is
                 # tracked by obs_history_is_pad on the state side. Camera _is_pad only
@@ -985,6 +994,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     self.resolution[1],
                     self.resolution[0],
                     pad_value=0,
+                    center_padding=self.center_image_padding,
                 )
                 image_is_pad.append(item.get(key + "_is_pad", torch.tensor(False)).item())
 
@@ -1233,6 +1243,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     self.resolution[1],
                     self.resolution[0],
                     pad_value=0,
+                    center_padding=self.center_image_padding,
                 )
             # Subgoals are always single-frame regardless of n_obs_history.
             self._assert_image_in_unit_range(standard_item[out_key], name=out_key, expect_temporal=False)
@@ -1296,17 +1307,28 @@ class BaseDataset(torch.utils.data.Dataset):
                 standard_item["fps"] = torch.tensor(effective_fps, dtype=torch.long)
                 standard_item["fps_is_pad"] = torch.tensor(False)
 
-    def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
+    def resize_with_pad(
+        self,
+        img,
+        width,
+        height,
+        pad_value=0,
+        center_padding: bool = False,
+    ) -> torch.Tensor:
         """Resize an image to target dimensions with padding.
 
         Maintains aspect ratio by resizing to fit within target dimensions,
-        then pads on the left and top to reach exact target size.
+        then pads to reach the exact target size. Padding defaults to the
+        historical left/top placement; STEAM opts into centered padding.
 
         Args:
             img: Input image tensor of shape (C, H, W) or (T, C, H, W).
             width: Target width.
             height: Target height.
             pad_value: Value to use for padding. Defaults to 0.
+            center_padding: Split padding across both sides of each spatial
+                axis. Defaults to False, which keeps all padding on the left
+                and top.
 
         Returns:
             Resized and padded image tensor of shape (C, height, width) or
@@ -1339,7 +1361,20 @@ class BaseDataset(torch.utils.data.Dataset):
         pad_height = max(0, int(height - resized_height))
         pad_width = max(0, int(width - resized_width))
 
-        padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
+        if center_padding:
+            pad_top, extra_height = divmod(pad_height, 2)
+            pad_bottom = pad_top + extra_height
+            pad_left, extra_width = divmod(pad_width, 2)
+            pad_right = pad_left + extra_width
+        else:
+            pad_left, pad_right = pad_width, 0
+            pad_top, pad_bottom = pad_height, 0
+
+        padded_img = F.pad(
+            resized_img,
+            (pad_left, pad_right, pad_top, pad_bottom),
+            value=pad_value,
+        )
 
         if not batched:
             padded_img = padded_img.squeeze(0)
