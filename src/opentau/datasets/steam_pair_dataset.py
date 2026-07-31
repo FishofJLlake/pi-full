@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from collections import defaultdict
 from typing import Literal
 
@@ -169,7 +170,9 @@ class SteamPairDataset(Dataset):
 
         signed_offset = frame_tk - frame_t
         episode_length = len(records)
-        scaled_offset = signed_offset * self.length_reference / episode_length
+        scaled_offset = float(signed_offset)
+        if self.config.length_scale_enabled:
+            scaled_offset *= self.length_reference / episode_length
         target_bin = scaled_signed_offset_to_bin(
             scaled_offset,
             self.config.max_temporal_offset,
@@ -198,6 +201,33 @@ class SteamPairDataset(Dataset):
             anchor_index, direction = divmod(index, 2)
             return self._make_pair(anchor_index, reverse=bool(direction))
         return self._make_pair(index, reverse=False)
+
+    def target_bin_histogram(self) -> list[int]:
+        """Count every valid training target without consuming the training RNG."""
+        histogram = np.zeros(self.config.num_bins, dtype=np.int64)
+        for records in self._episodes.values():
+            episode_length = len(records)
+            max_stride = min(self.config.max_temporal_offset, episode_length - 1)
+            for stride in range(1, max_stride + 1):
+                scaled = float(stride)
+                if self.config.length_scale_enabled:
+                    scaled *= self.length_reference / episode_length
+                multiplicity = episode_length - stride
+                histogram[
+                    scaled_signed_offset_to_bin(
+                        scaled,
+                        self.config.max_temporal_offset,
+                        self.config.num_bins,
+                    )
+                ] += multiplicity
+                histogram[
+                    scaled_signed_offset_to_bin(
+                        -scaled,
+                        self.config.max_temporal_offset,
+                        self.config.num_bins,
+                    )
+                ] += multiplicity
+        return histogram.tolist()
 
 
 def get_steam_pair_dataset(dataset) -> SteamPairDataset:
@@ -229,4 +259,20 @@ def set_global_length_reference(
     reference = float(np.percentile(np.asarray(lengths, dtype=np.float64), percentile))
     for wrapper in wrappers:
         wrapper.set_length_reference(reference)
+        logging.info(
+            "STEAM source=%s episodes=%d episode_lengths[min/median/max]=%d/%.1f/%d "
+            "length_scale_enabled=%s target_bin_histogram=%s",
+            wrapper.repo_id,
+            len(wrapper.episode_lengths),
+            min(wrapper.episode_lengths),
+            float(np.median(wrapper.episode_lengths)),
+            max(wrapper.episode_lengths),
+            wrapper.config.length_scale_enabled,
+            wrapper.target_bin_histogram(),
+        )
+    logging.info(
+        "STEAM global length reference: percentile=%.3f value=%.3f",
+        percentile,
+        reference,
+    )
     return reference

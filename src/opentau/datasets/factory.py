@@ -91,6 +91,7 @@ from opentau.datasets.lerobot_dataset import (
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, feature_mapping_key
 from opentau.datasets.steam_pair_dataset import (
     SteamPairDataset,
+    get_steam_pair_dataset,
     set_global_length_reference,
 )
 from opentau.datasets.transforms import ImageTransforms
@@ -579,11 +580,24 @@ def make_dataset_mixture(
     _validate_metadata_requirements(cfg, datasets, label="train")
     if val_datasets:
         _validate_metadata_requirements(cfg, val_datasets, label="val")
-    if isinstance(cfg.policy, SteamConfig):
+    if isinstance(cfg.policy, SteamConfig) and cfg.policy.length_scale_enabled:
         set_global_length_reference(
             datasets + val_datasets,
             cfg.policy.length_reference_percentile,
         )
+    elif isinstance(cfg.policy, SteamConfig):
+        for dataset in datasets + val_datasets:
+            wrapper = get_steam_pair_dataset(dataset)
+            logging.info(
+                "STEAM source=%s episodes=%d episode_lengths[min/median/max]=%d/%.1f/%d "
+                "length_scale_enabled=False target_bin_histogram=%s",
+                wrapper.repo_id,
+                len(wrapper.episode_lengths),
+                min(wrapper.episode_lengths),
+                float(np.median(wrapper.episode_lengths)),
+                max(wrapper.episode_lengths),
+                wrapper.target_bin_histogram(),
+            )
 
     train_weights = _resolve_weights(cfg.dataset_mixture.weights, datasets, label="train")
     train_mixture = WeightedDatasetMixture(cfg, datasets, train_weights, cfg.dataset_mixture.action_freq)

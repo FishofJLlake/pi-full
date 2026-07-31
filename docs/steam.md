@@ -6,13 +6,17 @@ STEAM 是独立的 `policy.type="steam"` 时序进度模型。它不依赖 Value
 
 - STEAM 训练 pair 的两帧必须来自同一 episode。
 - 数据集必须显式设置 `steam_source` 为 `expert` 或 `non_expert`。
-- 时序偏移按全局 episode 长度参考缩放后映射到带符号 bins。
-- Advantage 生成固定加载三个独立 checkpoint，并对三个进度差取最小值。
+- 默认使用 SigLIP 原生 `384x384` 输入；配置与输入分辨率不一致时直接报错，不做静默上采样。
+- 时序偏移映射到带符号 bins；轨迹长度缩放由 `length_scale_enabled` 显式控制。
+- Ensemble 支持任意 `N >= 1`，并按 RLinf 的逐帧 worst-of-N（最小 signed score）聚合。
+- 独立成员可合并为一个 `members.N.*` checkpoint；单成员合并 checkpoint 仍保留 ensemble 轴。
 - terminal frame 的 raw/effective advantage 都是 `0.0`，来源为 `steam_terminal_default`。
 
 ## 训练 STEAM ensemble
 
-示例配置见 [steam_training_config.json](../configs/examples/steam_training_config.json)。训练循环变更的本地验证只能使用仓库允许的 smoke 配置；不要直接运行示例中的生产步数。
+常规示例见 [steam_training_config.json](../configs/examples/steam_training_config.json)，与 RLinf
+关键超参数对齐的参考配置见 [steam_rlinf_parity_config.json](../configs/examples/steam_rlinf_parity_config.json)：384 分辨率、32 bins、16k steps、两卡 global batch 512、AdamW `5e-5` 和 500-step warmup。
+训练循环变更的本地验证只能使用仓库允许的 smoke 配置；不要直接运行生产步数。
 
 ```powershell
 opentau-train --accelerate-config configs/examples/accelerate_ddp_config.yaml --config_path=configs/examples/steam_training_config.json --seed=0 --output_dir=outputs/steam/member_0
@@ -20,16 +24,31 @@ opentau-train --accelerate-config configs/examples/accelerate_ddp_config.yaml --
 opentau-train --accelerate-config configs/examples/accelerate_ddp_config.yaml --config_path=configs/examples/steam_training_config.json --seed=2 --output_dir=outputs/steam/member_2
 ```
 
-## 生成 advantage bundle
-
-数据配置见 [steam_advantage_config.json](../configs/examples/steam_advantage_config.json)。三个 checkpoint 的数量是强约束。
+把任意数量的成员合并成一个 checkpoint：
 
 ```powershell
-opentau-steam-advantages `
-  --checkpoint outputs/steam/member_0/checkpoints/030000 `
-  --checkpoint outputs/steam/member_1/checkpoints/030000 `
-  --checkpoint outputs/steam/member_2/checkpoints/030000 `
-  --dataset-mixture configs/examples/steam_advantage_config.json
+opentau-steam-merge-ensemble `
+  --member outputs/steam/member_0/checkpoints/030000 `
+  --member outputs/steam/member_1/checkpoints/030000 `
+  --member outputs/steam/member_2/checkpoints/030000 `
+  --output outputs/steam/ensemble_3
+```
+
+`--member PATH:idx` 还可以从已有 ensemble checkpoint 中抽取指定成员。
+
+## 生成 advantage bundle
+
+数据配置见 [steam_advantage_config.json](../configs/examples/steam_advantage_config.json)。推荐传入一个已合并的 ensemble checkpoint；也可以重复 `--checkpoint` 拼接多个单成员或 ensemble checkpoint。
+`torchrun` 会对每个数据集做连续均衡分片，所有 rank 完成推理后仅由 rank 0 写入结果。
+
+```powershell
+torchrun --standalone --nproc-per-node=2 -m opentau.scripts.compute_steam_advantages `
+  --checkpoint outputs/steam/ensemble_3 `
+  --dataset-mixture configs/examples/steam_advantage_config.json `
+  --score-mode rlinf_signed `
+  --label-mode quantile `
+  --expert-positive-fraction 0.8 `
+  --non-expert-positive-fraction 0.3
 ```
 
 每个数据集输出：
@@ -38,8 +57,10 @@ opentau-steam-advantages `
 - `meta/raw_advantages.json`
 - `meta/advantage_sources.json`
 - `meta/advantage_report.json`
+- `meta/advantages_<tag>.parquet`
+- `meta/steam_advantage_diagnostics.json`
 
-四份文件使用 `episode_index,frame_index` 键并要求选中帧覆盖率为 `1.0`。
+JSON bundle 保持现有消费者兼容；Parquet 使用 RLinf 风格字段，并额外保留 paper-baseline、signed-bin、成员熵与 provenance。diagnostics 文件保存每个成员曲线，供视频可视化读取。默认标签语义使用 RLinf signed score 和严格 `>`；旧行为可显式选择 `--score-mode paper_baseline --threshold-comparison inclusive`。
 
 ## PI0.5 conditioning
 
@@ -58,13 +79,25 @@ opentau-steam-advantages `
 
 ## 可视化
 
+生成“上方视频、下方 advantage 曲线”的对齐 MP4：
+
+```powershell
+opentau-steam-visualize `
+  --dataset-config configs/examples/steam_advantage_config.json `
+  --dataset-index 0 `
+  --episode 42 `
+  --camera-key camera0 `
+  --output outputs/steam/episode_42_advantage.mp4
+```
+
+输出固定为 800x880 H.264/yuv420p：上方 800x600 按比例 letterbox、绝不裁剪；下方 800x280 绘制浅色成员曲线、黑色 ensemble minimum 和红色当前帧标记。帧号读取真实 `frame_index`，FPS 默认取数据集 metadata。若 diagnostics 不存在，会警告并退化为仅显示聚合曲线。
+
+原有 Streamlit 浏览器仍可用于交互检查 JSON bundle：
+
 ```powershell
 streamlit run src/opentau/scripts/value_visualizer_app.py -- `
   --dataset-config DATASET_CONFIG.json `
   --values DATASET_ROOT/meta/raw_advantages.json `
   --effective-advantages DATASET_ROOT/meta/advantages.json `
-  --advantage-sources DATASET_ROOT/meta/advantage_sources.json `
-  --series-label "STEAM Advantage"
+  --advantage-sources DATASET_ROOT/meta/advantage_sources.json
 ```
-
-可视化器只用 frame index 查找；timestamp 仅用于展示。

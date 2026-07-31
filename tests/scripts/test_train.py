@@ -42,8 +42,21 @@ from opentau.scripts.train import (
     _mixture_weighted_aggregate,
     _run_post_optimizer_step,
     _sync_deepspeed_gradient_accumulation_steps,
+    training_budget_summary,
 )
 from opentau.utils.logging_utils import AverageMeter, MetricsTracker
+
+
+def test_training_budget_summary_makes_global_batch_semantics_explicit():
+    cfg = SimpleNamespace(
+        dataloader_batch_size=64,
+        gradient_accumulation_steps=4,
+        steps=16_000,
+    )
+    summary = training_budget_summary(cfg, world_size=2)
+    assert summary["per_rank_optimizer_batch"] == 256
+    assert summary["effective_global_batch"] == 512
+    assert summary["total_sample_budget"] == 8_192_000
 
 
 class TestFindUnusedParamsFromEnv:

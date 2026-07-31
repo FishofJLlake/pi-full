@@ -310,6 +310,11 @@ def update_policy(
         if "Accuracy" in losses
         else None
     )
+    neighbor_accuracy = (
+        accelerator.gather_for_metrics(losses["NeighborAccuracy"]).to(dtype=torch.float32).mean().item()
+        if "NeighborAccuracy" in losses
+        else None
+    )
     # Surface the state/action outlier warning on rank 0 (and thus wandb) regardless of which rank
     # held the offending sample. Runs on every rank (it gathers internally); gated on a rank-uniform
     # config check so policies without the field (pi0/pi05/pi06) skip it without an NCCL mismatch.
@@ -326,6 +331,7 @@ def update_policy(
         train_metrics.ce_loss = ce_loss
         _observe_optional(train_metrics, "l1_loss", "l1_loss", ":.6f", l1_loss)
         _observe_optional(train_metrics, "accuracy", "accuracy", ":.3f", accuracy)
+        _observe_optional(train_metrics, "neighbor_accuracy", "neighbor_accuracy", ":.3f", neighbor_accuracy)
         train_metrics.lr = optimizer.param_groups[0]["lr"]
 
     return train_metrics
@@ -752,6 +758,23 @@ def _validate_ema_backend(ema_decay: float | None, distributed_type: accelerate.
         )
 
 
+def training_budget_summary(cfg: TrainPipelineConfig, world_size: int) -> dict[str, int]:
+    """Return explicit per-rank and global batch/sample semantics."""
+    if world_size < 1:
+        raise ValueError(f"world_size must be positive, got {world_size}.")
+    per_rank_micro_batch = int(cfg.dataloader_batch_size)
+    per_rank_optimizer_batch = per_rank_micro_batch * int(cfg.gradient_accumulation_steps)
+    effective_global_batch = per_rank_optimizer_batch * world_size
+    return {
+        "per_rank_micro_batch": per_rank_micro_batch,
+        "gradient_accumulation_steps": int(cfg.gradient_accumulation_steps),
+        "per_rank_optimizer_batch": per_rank_optimizer_batch,
+        "world_size": world_size,
+        "effective_global_batch": effective_global_batch,
+        "total_sample_budget": effective_global_batch * int(cfg.steps),
+    }
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
@@ -891,6 +914,10 @@ def train(cfg: TrainPipelineConfig):
             cfg.policy.use_torch_compile = False
 
     logging.info(pformat(cfg.to_dict()))
+    logging.info(
+        "Training batch/sample budget: %s",
+        training_budget_summary(cfg, accelerator.num_processes),
+    )
 
     if accelerator.is_main_process:
         accelerator_config = encode_accelerator_state_dict(accelerator.state.__dict__)
@@ -1167,10 +1194,8 @@ def train(cfg: TrainPipelineConfig):
     policy.train()
 
     # setup metrics tracker to average metrics over the logging interval.
-    # ``l1_loss`` and ``accuracy`` are populated lazily in ``update_policy``
-    # iff the policy's ``forward`` returns ``"L1"`` / ``"Accuracy"`` (only the
-    # value head currently does); omitting them here keeps logs clean for VLA
-    # policies that don't emit those losses.
+    # Optional policy metrics are populated lazily in ``update_policy``. Keeping
+    # them out of the initial dictionary avoids empty metrics for policies that do not emit them.
     train_metrics = {
         "loss": AverageMeter("total_loss", ":.6f"),
         "mse_loss": AverageMeter("mse_loss", ":.6f"),
@@ -1228,6 +1253,8 @@ def train(cfg: TrainPipelineConfig):
             accelerator.log({"Training/CE Loss": log_dict["ce_loss"]}, step=step)
             if "l1_loss" in train_tracker.metrics:
                 accelerator.log({"Training/L1 Loss": log_dict["l1_loss"]}, step=step)
+            if "neighbor_accuracy" in train_tracker.metrics:
+                accelerator.log({"Training/Neighbor Accuracy": log_dict["neighbor_accuracy"]}, step=step)
             if "accuracy" in train_tracker.metrics:
                 accelerator.log({"Training/Accuracy": log_dict["accuracy"]}, step=step)
             accelerator.log({"Training/Learning Rate": log_dict["lr"]}, step=step)
@@ -1318,7 +1345,11 @@ def train(cfg: TrainPipelineConfig):
                 "source_index": [],
             }
             agg_tracker = _make_val_tracker()  # only used on the fallback (no per-sample) path
-            optional_vals: dict[str, list[float]] = {"l1_loss": [], "accuracy": []}
+            optional_vals: dict[str, list[float]] = {
+                "l1_loss": [],
+                "accuracy": [],
+                "neighbor_accuracy": [],
+            }
 
             logging.info(f"Validation at step {step}...")
 
@@ -1344,6 +1375,14 @@ def train(cfg: TrainPipelineConfig):
                         .mean()
                         .item()
                         if "Accuracy" in losses
+                        else None
+                    )
+                    neighbor_accuracy_val = (
+                        accelerator.gather_for_metrics(losses["NeighborAccuracy"])
+                        .to(dtype=torch.float32)
+                        .mean()
+                        .item()
+                        if "NeighborAccuracy" in losses
                         else None
                     )
 
@@ -1403,6 +1442,8 @@ def train(cfg: TrainPipelineConfig):
                             agg_tracker.ce_loss = ce_val
                         if l1_val is not None:
                             optional_vals["l1_loss"].append(l1_val)
+                        if neighbor_accuracy_val is not None:
+                            optional_vals["neighbor_accuracy"].append(neighbor_accuracy_val)
                         if accuracy_val is not None:
                             optional_vals["accuracy"].append(accuracy_val)
 
@@ -1482,6 +1523,14 @@ def train(cfg: TrainPipelineConfig):
                         {
                             "Validation/Accuracy": sum(optional_vals["accuracy"])
                             / len(optional_vals["accuracy"])
+                        },
+                        step=step,
+                    )
+                if optional_vals["neighbor_accuracy"]:
+                    accelerator.log(
+                        {
+                            "Validation/Neighbor Accuracy": sum(optional_vals["neighbor_accuracy"])
+                            / len(optional_vals["neighbor_accuracy"])
                         },
                         step=step,
                     )

@@ -44,10 +44,13 @@ class SteamConfig(PreTrainedConfig):
     language_pretrained_path: str = ""
     tokenizer_path: str = ""
     prompt_max_length: int = 128
+    image_resolution: tuple[int, int] = (384, 384)
 
     num_bins: int = 32
     max_temporal_offset: int = 32
     length_reference_percentile: float = 90.0
+    length_scale_enabled: bool = True
+    ensemble_size: int = 1
     fusion_hidden_dim: int = 512
     dropout: float = 0.1
     label_smoothing: float = 0.05
@@ -67,6 +70,12 @@ class SteamConfig(PreTrainedConfig):
         super().__post_init__()
         if self.n_obs_steps != 1:
             raise ValueError(f"STEAM supports n_obs_steps=1, got {self.n_obs_steps}.")
+        if self.ensemble_size < 1:
+            raise ValueError(f"ensemble_size must be >= 1, got {self.ensemble_size}.")
+        if len(self.image_resolution) != 2 or any(side < 1 for side in self.image_resolution):
+            raise ValueError(
+                f"image_resolution must contain two positive dimensions, got {self.image_resolution}."
+            )
         validate_binning(self.max_temporal_offset, self.num_bins)
         if not 0 < self.length_reference_percentile <= 100:
             raise ValueError(

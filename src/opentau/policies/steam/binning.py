@@ -90,3 +90,30 @@ def expected_signed_offset(probabilities: Tensor, max_temporal_offset: int, num_
         dtype=probabilities.dtype,
     )
     return reduce(probabilities * centers, "... bin -> ...", "sum")
+
+
+def rlinf_signed_bin_values(
+    num_bins: int,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Return RLinf STEAM's normalized signed values for categorical bins."""
+    if num_bins < 2 or num_bins % 2:
+        raise ValueError(f"num_bins must be >= 2 and even, got {num_bins}.")
+    half = num_bins // 2
+    values = [index / half for index in range(-half, 0)]
+    values.extend(index / half for index in range(1, half + 1))
+    return torch.tensor(values, device=device, dtype=dtype)
+
+
+def expected_rlinf_signed_score(probabilities: Tensor, num_bins: int) -> Tensor:
+    """Decode probabilities using RLinf's exact signed-bin expectation."""
+    if probabilities.shape[-1] != num_bins:
+        raise ValueError(f"Expected probabilities[..., {num_bins}], got {tuple(probabilities.shape)}.")
+    values = rlinf_signed_bin_values(
+        num_bins,
+        device=probabilities.device,
+        dtype=probabilities.dtype,
+    )
+    return reduce(probabilities * values, "... bin -> ...", "sum")

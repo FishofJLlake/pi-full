@@ -147,3 +147,21 @@ def test_global_reference_is_shared_across_datasets():
     reference = set_global_length_reference([first, second], percentile=100)
     assert reference == 5.0
     assert first.length_reference == second.length_reference == 5.0
+
+
+def test_length_scaling_can_be_disabled_for_rlinf_parity():
+    config = _config()
+    config.length_scale_enabled = False
+    dataset = SteamPairDataset(_FakeLeRobotDataset([8]), config, mode="inference")
+    dataset.set_length_reference(4)
+    pair = dataset[0]
+    assert pair["steam_scaled_offset"].item() == 4.0
+
+
+def test_target_bin_histogram_counts_all_valid_directions_without_rng():
+    dataset = SteamPairDataset(_FakeLeRobotDataset([3]), _config(), mode="training")
+    first = dataset.target_bin_histogram()
+    second = dataset.target_bin_histogram()
+    assert first == second
+    assert sum(first) == 6
+    assert sum(first[:4]) == sum(first[4:]) == 3

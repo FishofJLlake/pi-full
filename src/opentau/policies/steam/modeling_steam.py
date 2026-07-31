@@ -25,7 +25,7 @@ from torch import Tensor, nn
 from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.steam.binning import expected_signed_offset
+from opentau.policies.steam.binning import expected_rlinf_signed_score, expected_signed_offset
 from opentau.policies.steam.configuration_steam import SteamConfig
 
 
@@ -108,6 +108,12 @@ class SteamPolicy(PreTrainedPolicy):
 
         height, width = _image_size(image_processor)
         self.image_size = (height, width)
+        if self.image_size != tuple(config.image_resolution):
+            raise ValueError(
+                "STEAM image_resolution must match the vision processor's native input size; "
+                f"configured={tuple(config.image_resolution)}, processor={self.image_size}. "
+                "This prevents low-resolution dataset frames from being silently upsampled."
+            )
         mean = getattr(image_processor, "image_mean", [0.5, 0.5, 0.5])
         std = getattr(image_processor, "image_std", [0.5, 0.5, 0.5])
         self.register_buffer(
@@ -165,11 +171,10 @@ class SteamPolicy(PreTrainedPolicy):
     def _preprocess_images(self, images: Tensor) -> Tensor:
         images = images.to(dtype=torch.float32)
         if tuple(images.shape[-2:]) != self.image_size:
-            images = F.interpolate(
-                images,
-                size=self.image_size,
-                mode="bilinear",
-                align_corners=False,
+            raise ValueError(
+                "STEAM expects dataset frames at the vision tower's native resolution; "
+                f"received={tuple(images.shape[-2:])}, expected={self.image_size}. "
+                "Set TrainPipelineConfig.resolution and policy.image_resolution to the native size."
             )
         images = (images - self.image_mean) / self.image_std
         return images.to(dtype=_module_dtype(self.vision_encoder))
@@ -290,12 +295,14 @@ class SteamPolicy(PreTrainedPolicy):
             label_smoothing=self.config.label_smoothing,
         )
         accuracy = (logits.argmax(dim=-1) == labels).to(torch.float32).mean()
+        neighbor_accuracy = ((logits.argmax(dim=-1) - labels).abs() <= 1).to(torch.float32).mean()
         zero = torch.zeros_like(ce_loss, requires_grad=False)
         return {
             "MSE": zero,
             "CE": ce_loss,
             "L1": zero,
             "Accuracy": accuracy,
+            "NeighborAccuracy": neighbor_accuracy,
         }
 
     @torch.no_grad()
@@ -320,4 +327,8 @@ class SteamPolicy(PreTrainedPolicy):
             "expected_bin": expected_bin,
             "temporal_offset": temporal_offset,
             "signed_score": temporal_offset / self.config.max_temporal_offset,
+            "rlinf_signed_score": expected_rlinf_signed_score(
+                probabilities,
+                self.config.num_bins,
+            ),
         }

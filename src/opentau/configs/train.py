@@ -334,6 +334,15 @@ class TrainPipelineConfig(HubMixin):
                         "mismatch, set policy.skip_input_resolution_check=true."
                     )
 
+            steam_resolution = getattr(self.policy, "image_resolution", None)
+            if steam_resolution is not None and tuple(steam_resolution) != tuple(self.resolution):
+                raise ValueError(
+                    f"policy.image_resolution={tuple(steam_resolution)} != "
+                    f"resolution={tuple(self.resolution)} (both (H, W)). STEAM must receive "
+                    "the vision tower's native resolution directly; otherwise the model would "
+                    "silently upsample already downsampled dataset frames."
+                )
+
             # The policy's ``n_obs_steps`` determines the T dimension its
             # encoder expects; the dataset_mixture's ``n_obs_history`` is
             # what the dataloader actually produces. They must agree.

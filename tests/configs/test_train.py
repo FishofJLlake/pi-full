@@ -25,6 +25,7 @@ from draccus.utils import ParsingError
 from opentau.configs import parser
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.train import TrainPipelineConfig
+from opentau.policies.steam.configuration_steam import SteamConfig
 
 ARTIFACT_DIR = Path("tests/artifacts/configs")
 with open(ARTIFACT_DIR / "train_config.json") as f:
@@ -82,6 +83,22 @@ def test_validate_rejects_resize_resolution_mismatch(policy_config, dataset_mixt
     )
 
     with pytest.raises(ValueError, match="resize_imgs_with_padding"):
+        cfg.validate()
+
+
+def test_validate_rejects_steam_native_resolution_mismatch(dataset_mixture_config, tmp_path):
+    policy = SteamConfig(image_resolution=(384, 384))
+    cfg = TrainPipelineConfig(
+        dataset_mixture=dataset_mixture_config,
+        policy=policy,
+        output_dir=str(tmp_path / "steam_resolution_mismatch"),
+        seed=42,
+        batch_size=8,
+        use_policy_training_preset=True,
+        resolution=(224, 224),
+    )
+
+    with pytest.raises(ValueError, match="policy.image_resolution"):
         cfg.validate()
 
 
