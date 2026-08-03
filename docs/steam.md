@@ -62,6 +62,59 @@ torchrun --standalone --nproc-per-node=2 -m opentau.scripts.compute_steam_advant
 
 JSON bundle 保持现有消费者兼容；Parquet 使用 RLinf 风格字段，并额外保留 paper-baseline、signed-bin、成员熵与 provenance。diagnostics 文件保存每个成员曲线，供视频可视化读取。默认标签语义使用 RLinf signed score 和严格 `>`；旧行为可显式选择 `--score-mode paper_baseline --threshold-comparison inclusive`。
 
+## 无推理重标 advantage
+
+`opentau-steam-relabel` 只读取已有 `raw_advantages.json` 和
+`advantages_<source_tag>.parquet`，不会加载 STEAM checkpoint，也不会执行模型推理。基础标签先按
+`steam_source` 分开生成，再按以下优先级覆盖：
+
+1. expert/non-expert 各自的 `all_positive`、`threshold` 或 `quantile` 基础规则；
+2. 选定 source 的每条轨迹最后 N 帧强制为 positive；
+3. 显式映射的人类干预帧强制为 positive（最高优先级）。
+
+推荐先只验证统计：
+
+```powershell
+opentau-steam-relabel `
+  --dataset-mixture DATASET_MIXTURE.json `
+  --source-tag steam `
+  --output-tag steam_recovery_v1 `
+  --expert-mode all_positive `
+  --non-expert-mode quantile `
+  --non-expert-positive-fraction 0.3 `
+  --quantile-grouping actual_lookahead `
+  --tail-positive-frames 30 `
+  --tail-positive-sources expert `
+  --force-intervention-positive `
+  --intervention-positive-sources non_expert `
+  --dry-run
+```
+
+确认每个数据集和每个 `actual_lookahead` 桶的计数后，删除 `--dry-run` 才会写文件。
+若 expert 仍需保留 top 80%，把 expert 参数改为：
+
+```powershell
+--expert-mode quantile --expert-positive-fraction 0.8 --quantile-grouping actual_lookahead
+```
+
+这里的 top 80% 是在相同 `steam_source + actual_lookahead` 内跨轨迹排名，不是整条轨迹共用一个
+阈值。它能避免短 lookahead 的尾部帧与 `H=K` 的中段帧直接竞争。分位数采用确定性排序并精确取
+`ceil(桶大小 * fraction)` 个样本；同分时按数据集和帧 key 打破平局。
+
+尾部覆盖默认只允许 expert。只有确认 non-expert 轨迹末尾也是有效恢复/成功动作时，才显式传入
+`--tail-positive-sources expert non_expert`；否则失败 rollout 的卡死、放弃和失败 terminal 也会被标成
+positive。`--tail-positive-frames 30` 会包含每条轨迹的 terminal frame，与 STEAM 生成阶段默认将
+terminal 设为 0 的规则不同。
+
+人工干预覆盖要求数据配置通过 `data_features_name_mapping` 将标准角色 `intervention` 显式映射到
+一个逐帧列，例如 `"intervention": "human_intervention"`。默认仅当值严格大于
+`--intervention-value-threshold 0` 时置 1，不会从 `mistake` 或 episode success 猜测干预状态。
+
+每个数据集新增 `meta/advantages_<output_tag>.parquet` 和
+`meta/advantage_relabel_<output_tag>.json` 作为逐帧审计与汇总；同时原子更新 PI0.5 实际读取的
+`meta/advantages.json` 与 `meta/advantage_sources.json`。原始 `raw_advantages.json`、
+`advantage_report.json` 和 source-tag Parquet 保持不变。
+
 ## PI0.5 conditioning
 
 示例配置见 [pi05_steam_training_config.json](../configs/examples/pi05_steam_training_config.json)。核心配置为：

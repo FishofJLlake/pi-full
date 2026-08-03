@@ -257,6 +257,7 @@ def test_steam_and_so101_entrypoints_match_the_lockfile():
 
     expected_scripts = {
         "opentau-steam-advantages",
+        "opentau-steam-relabel",
         "opentau-so101-calibrate",
         "opentau-so101-teleoperate",
         "opentau-so101-record",
