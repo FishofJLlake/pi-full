@@ -64,13 +64,34 @@ JSON bundle 保持现有消费者兼容；Parquet 使用 RLinf 风格字段，�
 
 ## 无推理重标 advantage
 
-`opentau-steam-relabel` 只读取已有 `raw_advantages.json` 和
-`advantages_<source_tag>.parquet`，不会加载 STEAM checkpoint，也不会执行模型推理。基础标签先按
-`steam_source` 分开生成，再按以下优先级覆盖：
+`opentau-steam-relabel` 只读取已有 advantage bundle 和
+`advantages_<source_tag>.parquet`，不会加载 STEAM checkpoint，也不会执行模型推理。基础标签可按
+`steam_source` 重新生成，也可通过 `--preserve-existing-labels` 逐帧沿用当前 `advantages.json`；之后按
+以下优先级覆盖：
 
-1. expert/non-expert 各自的 `all_positive`、`threshold` 或 `quantile` 基础规则；
+1. 当前既有标签，或 expert/non-expert 各自的 `all_positive`、`threshold`、`quantile` 基础规则；
 2. 选定 source 的每条轨迹最后 N 帧强制为 positive；
 3. 显式映射的人类干预帧强制为 positive（最高优先级）。
+
+若需逐帧保留之前 `compute_steam_advantages --label-mode quantile` 生成的 expert 80% / non-expert
+30% 标签，只叠加 expert 尾部和 non-expert 人类干预覆盖，使用：
+
+```powershell
+opentau-steam-relabel `
+  --dataset-mixture DATASET_MIXTURE.json `
+  --source-tag steam `
+  --output-tag steam_recovery_v1 `
+  --preserve-existing-labels `
+  --tail-positive-frames 30 `
+  --tail-positive-sources expert `
+  --force-intervention-positive `
+  --intervention-positive-sources non_expert `
+  --dry-run
+```
+
+此模式不会重新计算 quantile、threshold 或 source-specific 基础标签；`--expert-mode`、
+`--non-expert-mode`、positive fraction、threshold 和 `--quantile-grouping` 均不参与基础标签生成。这样
+可完整保留原始推理的 percentile 边界与同分结果。确认统计后删除 `--dry-run` 才会写文件。
 
 推荐先只验证统计：
 

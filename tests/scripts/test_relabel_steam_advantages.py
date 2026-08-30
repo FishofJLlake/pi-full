@@ -36,6 +36,7 @@ from opentau.scripts.relabel_steam_advantages import (
     RelabelDataset,
     _apply_positive_overrides,
     _assign_base_labels,
+    _assign_preserved_labels,
     _compute_actual_lookahead,
     _output_dataframe,
     _persist_effective_bundle,
@@ -171,6 +172,51 @@ def test_tail_and_intervention_overrides_have_expected_priority(
     assert dataset.intervention_overrides == {(0, 0), (0, 2)}
 
 
+def test_preserved_labels_only_change_requested_positive_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    scores = {(0, frame): float(frame) / 10 for frame in range(5)}
+    dataset = _dataset(tmp_path, scores)
+    dataset.old_advantages = {
+        (0, 0): 0.0,
+        (0, 1): 1.0,
+        (0, 2): 0.0,
+        (0, 3): 0.0,
+        (0, 4): 0.0,
+    }
+    dataset.old_sources = dict.fromkeys(scores, "steam_expert_quantile_rlinf_signed_strict")
+    _compute_actual_lookahead([dataset], max_temporal_offset=3)
+    args = _args(
+        tail_positive_frames=2,
+        tail_positive_sources=["expert"],
+        force_intervention_positive=True,
+        intervention_positive_sources=["expert"],
+    )
+
+    _assign_preserved_labels([dataset])
+    monkeypatch.setattr(
+        relabel_module,
+        "_load_intervention_keys",
+        lambda dataset, *, value_threshold: {(0, 2), (0, 3)},
+    )
+    _apply_positive_overrides([dataset], args)
+
+    assert dataset.base_advantages == dataset.old_advantages
+    assert dataset.advantages == {
+        (0, 0): 0.0,
+        (0, 1): 1.0,
+        (0, 2): 1.0,
+        (0, 3): 1.0,
+        (0, 4): 1.0,
+    }
+    assert dataset.advantage_sources[(0, 0)] == "steam_expert_quantile_rlinf_signed_strict"
+    assert dataset.advantage_sources[(0, 3)] == "relabel_intervention_positive"
+    assert dataset.advantage_sources[(0, 4)] == "relabel_tail_positive"
+    assert dataset.tail_overrides == {(0, 3), (0, 4)}
+    assert dataset.intervention_overrides == {(0, 2), (0, 3)}
+
+
 def test_intervention_keys_are_read_from_explicit_mapped_column(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -255,7 +301,7 @@ def test_relabel_end_to_end_supports_dry_run_then_persist(tmp_path: Path):
     root = tmp_path / "dataset"
     keys = [(0, 0), (0, 1)]
     raw = {(0, 0): 0.2, (0, 1): 0.0}
-    old = dict.fromkeys(keys, 0.0)
+    old = {(0, 0): 1.0, (0, 1): 0.0}
     persist_advantage_bundle(
         root,
         keys,
@@ -293,14 +339,16 @@ def test_relabel_end_to_end_supports_dry_run_then_persist(tmp_path: Path):
         str(mixture_path),
         "--output-tag",
         "recovery",
-        "--expert-mode",
-        "all_positive",
+        "--preserve-existing-labels",
         "--tail-positive-frames",
         "1",
     ]
 
     dry_run = relabel_module.relabel(relabel_module.parse_args([*arguments, "--dry-run"]))
 
+    assert dry_run["settings"]["preserve_existing_labels"] is True
+    assert dry_run["datasets"][0]["positive_before_count"] == 1
+    assert dry_run["datasets"][0]["base_positive_count"] == 1
     assert dry_run["datasets"][0]["final_positive_count"] == 2
     assert load_advantages(root) == old
     assert not (root / "meta" / "advantages_recovery.parquet").exists()
@@ -319,6 +367,7 @@ def test_cli_defaults_are_safe_for_non_expert_tails():
 
     assert args.expert_mode == "all_positive"
     assert args.non_expert_mode == "quantile"
+    assert not args.preserve_existing_labels
     assert args.quantile_grouping == "actual_lookahead"
     assert args.tail_positive_sources == ["expert"]
     assert args.intervention_positive_sources == ["non_expert"]

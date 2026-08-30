@@ -14,10 +14,11 @@
 
 """Relabel existing STEAM scores without model inference.
 
-The script preserves raw_advantages.json, derives new binary labels separately
-for expert and non-expert sources, then optionally forces trajectory-tail and
-explicit human-intervention frames positive. The effective JSON bundle used by
-PI0.5 is updated in place while a new tagged Parquet keeps the relabel audit.
+The script preserves raw_advantages.json, either reuses existing binary labels
+or derives new labels separately for expert and non-expert sources, then
+optionally forces trajectory-tail and explicit human-intervention frames
+positive. The effective JSON bundle used by PI0.5 is updated in place while a
+new tagged Parquet keeps the relabel audit.
 """
 
 from __future__ import annotations
@@ -292,6 +293,16 @@ def _assign_base_labels(datasets: list[RelabelDataset], args: argparse.Namespace
         dataset.base_sources = dataset.advantage_sources.copy()
 
 
+def _assign_preserved_labels(datasets: list[RelabelDataset]) -> None:
+    """Reuse the effective labels and provenance already stored in each dataset."""
+    for dataset in datasets:
+        dataset.advantages = dataset.old_advantages.copy()
+        dataset.advantage_sources = dataset.old_sources.copy()
+        dataset.base_thresholds = dict.fromkeys(dataset.old_advantages, math.nan)
+        dataset.base_advantages = dataset.old_advantages.copy()
+        dataset.base_sources = dataset.old_sources.copy()
+
+
 def _resolve_intervention_column(dataset: RelabelDataset) -> str:
     mapping = dataset.config.data_features_name_mapping
     if mapping is None:
@@ -521,6 +532,7 @@ def _relabel_settings(args: argparse.Namespace, max_temporal_offset: int) -> dic
     return {
         "source_tag": args.source_tag,
         "output_tag": args.output_tag,
+        "preserve_existing_labels": args.preserve_existing_labels,
         "expert_mode": args.expert_mode,
         "non_expert_mode": args.non_expert_mode,
         "expert_threshold": args.expert_threshold,
@@ -610,7 +622,10 @@ def relabel(args: argparse.Namespace) -> dict[str, object]:
     ]
     max_temporal_offset = _infer_max_temporal_offset(datasets, args.max_temporal_offset)
     _compute_actual_lookahead(datasets, max_temporal_offset)
-    _assign_base_labels(datasets, args)
+    if args.preserve_existing_labels:
+        _assign_preserved_labels(datasets)
+    else:
+        _assign_base_labels(datasets, args)
     _apply_positive_overrides(datasets, args)
     _preflight_outputs(
         datasets,
@@ -651,6 +666,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-tag",
         required=True,
         help="New audit Parquet/diagnostics tag; must differ from source-tag.",
+    )
+    parser.add_argument(
+        "--preserve-existing-labels",
+        action="store_true",
+        help=(
+            "Use the current advantages.json and advantage_sources.json as the base without "
+            "recomputing expert/non-expert labels; only requested positive overrides are applied."
+        ),
     )
     parser.add_argument(
         "--expert-mode",
